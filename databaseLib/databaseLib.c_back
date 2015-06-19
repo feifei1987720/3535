@@ -1,0 +1,2874 @@
+/**********************************************************
+ * databaseLib.c
+
+ **********************************************************/
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/reboot.h>
+
+#include "param.h"
+#include "commonLib.h"
+#include "appLib.h"
+#include "recordLib.h"
+#include "diskLib.h"
+#include "onvif_client.h"
+#include "databaseLib.h"
+#include "sqlite3.h"
+#include "alarmLib.h"
+#include "configLib.h"
+#include "playbackLib.h"
+
+
+#define DATABASE_FILE		"/data/system.db"
+#define MAX_LOG_ROW  		1024
+
+
+#define DEFAULT_IP		"192.168.1.168"
+#define DEFAULT_MASK		"255.255.255.0"
+#define DEFAULT_GW		"192.168.1.1"
+#define DEFAULT_MAC		"00:11:22:33:44:55"
+#define DEFAULT_DNS1		"192.168.1.1"
+#define DEFAULT_DNS2		"192.168.1.1"
+
+#define DEFAULT_ETH0_NO		0
+#define DEFAULT_MULTICAST_ADDR	"0.0.0.0"
+#define DEFAULT_SERVER_ADDR	"0.0.0.0"
+#define DEFAULT_PLAYBACK_PORT	9000
+#define DEFAULT_RTSP_PORT	554
+#define DEFAULT_HTTP_PORT	80
+int GetIpResult = 0;
+static pthread_mutex_t databaseMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static sdk_motion_cfg_v2_t g_md_cfg[MAX_DISPLAY_NUM];
+static unsigned char g_md_cfg_flag = 0;
+
+static sdk_channel_t g_ch_cfg[MAX_DISPLAY_NUM];
+static unsigned char g_ch_cfg_flag = 0;
+
+static sdk_sys_cfg_t g_sys_cfg;
+static unsigned char g_sys_cfg_flag = 0;
+
+static sdk_record_cfg_t g_rec_cfg[MAX_DISPLAY_NUM];
+static unsigned char g_rec_cfg_flag = 0;
+
+static sdk_preview_t g_pre_cfg;
+static unsigned char g_pre_cfg_flag = 0;
+
+static sdk_comm_cfg_t g_comm_cfg;
+static unsigned char g_comm_cfg_flag = 0;
+
+static sdk_eth_cfg_t g_eth_cfg;
+static unsigned char g_eth_cfg_flag = 0;
+
+static sdk_net_mng_cfg_t g_net_mng_cfg;
+static unsigned char g_net_mng_cfg_flag = 0;
+
+static sdk_alarm_in_cfg_t g_alarm_cfg[MAX_ALARM_IN];
+static unsigned char g_alarm_cfg_flag[MAX_ALARM_IN] = {0};
+
+static sdk_ddns_cfg_t g_ddns_cfg;
+static unsigned char g_ddns_cfg_flag = 0;
+
+static sdk_upnp_t g_upnp_cfg;
+static unsigned char g_upnp_cfg_flag = 0;
+
+static sdk_28181_conf_t g_28181_cfg;
+static unsigned char g_28181_cfg_flag = 0;
+
+
+#if 0
+static int db_devChannelInfo(void *data, int column, char *value[], char *columnNames[])
+{
+	param_dev_channel_info_t *pDevChannelInfo = (param_dev_channel_info_t *)data;
+
+	pDevChannelInfo->channelNo = (int)atoi(value[1]);
+	pDevChannelInfo->streamNo = (int)atoi(value[2]);
+	strncpy(pDevChannelInfo->addr, value[3], sizeof(pDevChannelInfo->addr));
+	pDevChannelInfo->port = (int)atoi(value[4]);
+	strncpy(pDevChannelInfo->userName, value[5], sizeof(pDevChannelInfo->userName));
+	strncpy(pDevChannelInfo->userPwd, value[6], sizeof(pDevChannelInfo->userPwd));
+
+	return 0;
+}
+#endif
+
+
+static void db_create_mdtable(sqlite3 *db)
+{
+	int j = 0;
+	//char **dbResult;
+	char sql_cmd[512] = {0,};
+	//Printf("99999999999999999999999999999\n");
+	memset(sql_cmd,0,sizeof(sql_cmd));
+	sprintf(sql_cmd,"%s",
+		"CREATE TABLE motionDetect(channel INT PRIMARY KEY NOT NULL,motionEnable INT NOT NULL,beepEnable INT NOT NULL,beepTime  INT NOT NULL,recordEnable INT NOT NULL,recordTime INT NOT NULL,smtpEnable INT NOT NULL,ftpEnable INT NOT NULL,sensitivity  INT NOT  NULL,reserve INT NOT NULL);");
+	if(sqlite3_exec(db,sql_cmd,NULL,NULL,NULL) != SQLITE_OK)
+	{
+		Printf("sqlite3_exec error\r\n");
+		//ret = -1;
+		//break;
+	}
+	for(j = 0; j < MAX_DISPLAY_NUM; j++)
+	{
+		memset(sql_cmd,0,sizeof(sql_cmd));
+		sprintf(sql_cmd,"INSERT INTO motionDetect VALUES (%d,0,0,0,1,15,0,0,30,0);",j);
+		if(sqlite3_exec(db,sql_cmd,NULL,NULL,NULL) != SQLITE_OK)
+		{
+			Printf("insert failed \n");
+		}
+	}
+}
+
+static void db_create_ntdtable(sqlite3 *db)
+{
+	//int j = 0;
+	//char **dbResult;
+	char sql_cmd[512] = {0,};
+	char *err_msg;
+	//Printf("99999999999999999999999999999\n");
+	memset(sql_cmd,0,sizeof(sql_cmd));
+	sprintf(sql_cmd,"%s",
+		"CREATE TABLE NtdCfg(idx PRIMARY KEY NOT NULL, timezone INT NOT NULL,ntdserver CHAR(128) NOT NULL);");
+	if(sqlite3_exec(db,sql_cmd,NULL,NULL,&err_msg) != SQLITE_OK)
+	{
+		Printf("sqlite3_exec error\r\n");
+		//ret = -1;
+		//break;
+	}
+	memset(sql_cmd,0,sizeof(sql_cmd));
+	sprintf(sql_cmd,"INSERT INTO NtdCfg VALUES (0,8,\"clock.via.net\");");
+	if(sqlite3_exec(db,sql_cmd,NULL,NULL,NULL) != SQLITE_OK)
+	{
+		Printf("insert failed \n");
+	}
+}
+
+static void db_create_loginfotable(sqlite3 *db)
+{
+	char sql_cmd[512] = {0,};
+	//Printf("99999999999999999999999999999\n");
+	memset(sql_cmd,0,sizeof(sql_cmd));
+	sprintf(sql_cmd,"%s",
+		"CREATE TABLE logInfo2(idx PRIMARY KEY NOT NULL, type INT NOT NULL,time CHAR(64) NOT NULL);");
+	if(sqlite3_exec(db,sql_cmd,NULL,NULL,NULL) != SQLITE_OK)
+	{
+		Printf("sqlite3_exec error\r\n");
+		//ret = -1;
+		//break;
+	}
+	/*
+	memset(sql_cmd,0,sizeof(sql_cmd));
+	sprintf(sql_cmd,"INSERT INTO NtdCfg VALUES (0,0,"");");
+	if(sqlite3_exec(db,sql_cmd,NULL,NULL,NULL) != SQLITE_OK)
+	{
+		printf("insert failed \n");
+	}
+	*/
+}
+
+/*  */
+void databaseLibInit()
+{
+	//int i = 0, j = 0;
+	//int index = 0;
+	//int ret = 0;
+	sqlite3 *db;
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	//int init_mode = 0;
+	int flag[64] = {0};
+	char sql_cmd[512] = {0};
+
+	pthread_mutex_lock(&databaseMutex);
+
+	/**/
+	if(SQLITE_OK != sqlite3_open(DATABASE_FILE, &db))
+	{
+		sqlite3_close(db);
+		pthread_mutex_unlock(&databaseMutex);
+		return ;
+		/*send error msg*/
+	}
+
+	/*  */
+	/* ddns */
+	sprintf(sql_cmd, "select * from ddns");
+	result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+	if(SQLITE_OK != result)
+	{
+		flag[0] = 1;
+	}
+	sqlite3_free_table(dbResult);
+
+	/* upnp */
+	sprintf(sql_cmd, "select * from upnp");
+	result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+	if(SQLITE_OK != result)
+	{
+		flag[1] = 1;
+	}
+	sqlite3_free_table(dbResult);
+
+	/* gb28181 */
+	sprintf(sql_cmd, "select * from gb28181");
+	result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+	if(SQLITE_OK != result)
+	{
+		flag[2] = 1;
+	}
+	sqlite3_free_table(dbResult);
+
+	sprintf(sql_cmd,"%s","select * from motionDetect");
+	if(sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL) != SQLITE_OK)
+		db_create_mdtable(db);
+	sqlite3_free_table(dbResult);
+		
+
+	Printf("create ntdcfg \n");
+	sprintf(sql_cmd,"%s","select * from NtdCfg");
+	if(sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL) != SQLITE_OK)
+		db_create_ntdtable(db);
+	sqlite3_free_table(dbResult);
+
+	Printf("create loginfo2 \n");
+	sprintf(sql_cmd,"%s","select * from logInfo2");
+	if(sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL) != SQLITE_OK)
+		db_create_loginfotable(db);
+	sqlite3_free_table(dbResult);
+	
+	/*  */
+	sqlite3_close(db);
+
+	if(flag[0] == 1)
+	{
+		system("sqlite3 /data/system.db < /app/sql/ddns.sql");
+	}
+	if(flag[1] == 1)
+	{
+		system("sqlite3 /data/system.db < /app/sql/upnp.sql");
+	}
+	if(flag[2] == 1)
+	{
+		system("sqlite3 /data/system.db < /app/sql/gb28181.sql");
+	}
+
+	pthread_mutex_unlock(&databaseMutex);
+}
+
+/*  */
+void databaseLibDestroy()
+{
+
+}
+
+
+static int db_op_motion_detect(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	if ( SDK_PARAM_SET == subType )
+	{ 
+		sdk_motion_cfg_v2_t md_cfg;
+		sdk_motion_cfg_v2_t *p_cfg = (sdk_motion_cfg_v2_t *)pRecvData;
+		int channel = *(int *)data;
+
+		if(channel == CHANN_TYPE_ALL)
+		{
+			for(j = 0; (j < MAX_DISPLAY_NUM) && (j < configGetDisplayNum()); j++)
+			{
+				if((g_md_cfg_flag == 0) || (memcmp(p_cfg, &g_md_cfg[j], sizeof(sdk_motion_cfg_v2_t)) != 0))
+				{
+					memset(&md_cfg, 0, sizeof(sdk_motion_cfg_v2_t));
+					memcpy(&md_cfg, p_cfg, sizeof(sdk_motion_cfg_v2_t));
+					memset(sql_cmd,0,sizeof(sql_cmd));
+					sprintf(sql_cmd,"update motionDetect set motionEnable=%d, beepEnable=%d, beepTime=%d, recordEnable=%d, recordTime=%d, smtpEnable=%d, ftpEnable=%d, sensitivity=%d where channel=%d",
+							md_cfg.enable, md_cfg.beep_enable, md_cfg.beep_time, md_cfg.record_enable, md_cfg.record_time,
+							md_cfg.smtp_enable, md_cfg.ftp_enable, md_cfg.sensitivity, j);
+					//printf("sssssss sql_cmd = (%s)\r\n", sql_cmd);
+					if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						Printf("sqlite3_exec error\r\n");
+						ret = -1;
+					}
+					else
+					{
+						//md_cfg.chann_no = j;
+						//md_cfg.chann_win_mode = ch_cfg.chann_win_mode;
+						//memcpy(&g_ch_cfg[j], &ch_cfg, sizeof(sdk_channel_t));
+						//appStartDecodeChannel(&ch_cfg);
+					}
+					recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+				}
+			}
+			//recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+		}
+		else
+		{
+			//Printf("sssssssssssss g_ch_cfg_flag = %d, enable = %d.%d\r\n", g_ch_cfg_flag, p_cfg->enable, g_ch_cfg[channel].enable);
+			if((g_md_cfg_flag == 0) || (memcmp(p_cfg, &g_md_cfg[channel], sizeof(sdk_motion_cfg_v2_t)) != 0))
+			{
+				char *err_msg = NULL;
+				memset(&md_cfg, 0, sizeof(sdk_motion_cfg_v2_t));
+				memcpy(&md_cfg, p_cfg, sizeof(sdk_motion_cfg_v2_t));
+				memset(sql_cmd,0,sizeof(sql_cmd));
+				sprintf(sql_cmd,"update motionDetect set motionEnable=%d, beepEnable=%d, beepTime=%d, recordEnable=%d, recordTime=%d, smtpEnable=%d, ftpEnable=%d, sensitivity=%d where channel=%d",
+							md_cfg.enable, md_cfg.beep_enable, md_cfg.beep_time, md_cfg.record_enable, md_cfg.record_time,
+							md_cfg.smtp_enable, md_cfg.ftp_enable, md_cfg.sensitivity, channel);
+				//printf("sssssss sql_cmd = (%s)\r\n", sql_cmd);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, &err_msg))
+				{
+					Printf("sqlite3_exec error   %s\r\n",err_msg);
+					ret = -1;
+				}
+				else
+				{
+					//ch_cfg.chann_no = channel;
+					//ch_cfg.chann_win_mode = ch_cfg.chann_win_mode;
+					//memcpy(&g_ch_cfg[channel], &ch_cfg, sizeof(sdk_channel_t));
+					//appStartDecodeChannel(&ch_cfg);
+					//recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+				}
+				recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+			}
+		}
+	}
+	else
+	{
+		sdk_motion_cfg_v2_t *p_cfg = (sdk_motion_cfg_v2_t *)pRecvData;
+		int channel = *(int *)data;
+
+		if(channel == CHANN_TYPE_ALL)
+		{
+			memset(sql_cmd,0,sizeof(sql_cmd));
+			if(g_md_cfg_flag == 0)
+			{
+				sprintf(sql_cmd, "select * from motionDetect");
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+					
+					for(i = 0; (i < nRow) && (i < configGetDisplayNum()); i++)
+					{
+						memset(&g_md_cfg[i], 0, sizeof(sdk_motion_cfg_v2_t));
+
+						g_md_cfg[i].enable = atoi(dbResult[(i + 1) * nColumn + 1]);
+						g_md_cfg[i].beep_enable = atoi(dbResult[(i + 1) * nColumn + 2]);
+						g_md_cfg[i].beep_time = atoi(dbResult[(i + 1) * nColumn + 3]);
+						g_md_cfg[i].record_enable = atoi(dbResult[(i + 1) * nColumn + 4]);
+						g_md_cfg[i].record_time = atoi(dbResult[(i + 1) * nColumn + 5]);
+						g_md_cfg[i].smtp_enable = atoi(dbResult[(i + 1) * nColumn + 6]);
+						g_md_cfg[i].ftp_enable = atoi(dbResult[(i + 1) * nColumn + 7]);
+						g_md_cfg[i].sensitivity = atoi(dbResult[(i+1)*nColumn+8]);
+						memcpy((char *)p_cfg + ret, &g_md_cfg[i], sizeof(sdk_motion_cfg_v2_t));
+						ret += sizeof(sdk_motion_cfg_v2_t);
+					}
+					g_md_cfg_flag = 1;
+				}
+				else
+				{
+				}
+
+				sqlite3_free_table(dbResult);
+			}
+			else
+			{
+				memcpy((char *)p_cfg, &g_md_cfg, sizeof(g_md_cfg));
+				ret = configGetDisplayNum() * sizeof(sdk_motion_cfg_v2_t);
+			}
+		}
+		else
+		{
+			//if(channel >= MAX_DISPLAY_NUM || channel >= configGetDisplayNum())
+			//	break;
+			if(g_md_cfg_flag == 0)
+			{
+				memset(sql_cmd,0,sizeof(sql_cmd));
+				sprintf(sql_cmd, "select * from motionDetect where channel=%d", channel);
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+					
+					for(i = 0; (i < nRow) && (i < configGetDisplayNum()); i++)
+					{
+						memset(&g_md_cfg[channel], 0, sizeof(sdk_motion_cfg_v2_t));
+
+						g_md_cfg[channel].enable = atoi(dbResult[(i + 1) * nColumn + 1]);
+						g_md_cfg[channel].beep_enable = atoi(dbResult[(i + 1) * nColumn + 2]);
+						g_md_cfg[channel].beep_time = atoi(dbResult[(i + 1) * nColumn + 3]);
+						g_md_cfg[channel].record_enable = atoi(dbResult[(i + 1) * nColumn + 4]);
+						g_md_cfg[channel].record_time = atoi(dbResult[(i + 1) * nColumn + 5]);
+						g_md_cfg[channel].smtp_enable = atoi(dbResult[(i + 1) * nColumn + 6]);
+						g_md_cfg[channel].ftp_enable = atoi(dbResult[(i + 1) * nColumn + 7]);
+						g_md_cfg[channel].sensitivity = atoi(dbResult[(i+1)*nColumn+8]);
+						memcpy((char *)p_cfg + ret, &g_md_cfg[channel], sizeof(sdk_motion_cfg_v2_t));
+						ret += sizeof(sdk_motion_cfg_v2_t);
+					}
+					//g_md_cfg_flag=1;
+				}
+
+				sqlite3_free_table(dbResult);
+			}
+			else
+			{
+				memcpy(p_cfg, &g_md_cfg[channel], sizeof(sdk_motion_cfg_v2_t));
+			}
+			ret = sizeof(sdk_motion_cfg_v2_t);
+		}
+
+		//break;
+	}
+	return ret;
+}
+
+int db_op_log(int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[256] = {0,};
+	char st[32] = {0,};
+	char et[32] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	char *err_msg = NULL;
+
+	sqlite3 *db;
+
+	pthread_mutex_lock(&databaseMutex);
+
+	/**/
+	if(SQLITE_OK != sqlite3_open(DATABASE_FILE, &db))
+	{
+		sqlite3_close(db);
+		pthread_mutex_unlock(&databaseMutex);
+		return -1;
+		/*send error msg*/
+	}
+
+	//usleep(100*1000);
+	//Printf("type = %d,subtype = %d,g_comm_cfg.resolution=%d,MAX_DISPLAY_NUM=%d \n",type,subType,g_comm_cfg.resolution,MAX_DISPLAY_NUM);
+
+	sqlite3_exec(db, "begin transaction", NULL, NULL, NULL);
+
+	//int init_mode = 0;
+	//sdk_log_cond_t *cond = (sdk_log_cond_s*)pRecvData;
+	//sdk_log_item_t *log_item = (sdk_log_item_t)pRecvData;
+	
+	//sprintf(st,"%d:%2d:%2d:%2d:%2d:%2d",cond->begin_time.year,cond->begin_time.mon,cond->begin_time.day,cond->begin_time.hour,cond->begin_time.min,cond->begin_time.sec);
+	//sprintf(st,"%d:%2d:%2d:%2d:%2d:%2d",cond->end_time.year,cond->end_time.mon,cond->end_time.day,cond->end_time.hour,cond->end_time.min,cond->end_time.sec);
+	if(subType == SDK_LOG_QUERY)
+	{
+		sdk_log_cond_t *pCond = (sdk_log_cond_t*)pRecvData;
+		char timebuf_low[32], timebuf_high[32];
+		
+		sprintf(timebuf_low, "%04d-%02d-%02d-%02d-%02d-%02d", 
+				pCond->begin_time.year, pCond->begin_time.mon, 
+				pCond->begin_time.day, pCond->begin_time.hour, 
+				pCond->begin_time.min, pCond->begin_time.sec);
+
+		sprintf(timebuf_high, "%04d-%02d-%02d-%02d-%02d-%02d", 
+				pCond->end_time.year, pCond->end_time.mon, 
+				pCond->end_time.day, pCond->end_time.hour, 
+				pCond->end_time.min, pCond->end_time.sec);
+		
+		sprintf(sql_cmd, "select * from logInfo2");
+		result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, &err_msg);
+		if(SQLITE_OK == result)
+		{
+			int i = 0;
+			sdk_log_item_t *pItem = (sdk_log_item_t *)pRecvData;
+			int num = 0;
+			Printf("nRow = %d ,timebuf_low = %s,timebuf_high=%s,\n",nRow,timebuf_low,timebuf_high);
+			for(i=0;i<nRow && i<256;i++)
+			{
+				Printf("cur time  = %s \n",dbResult[(i+1)*nColumn+2]);
+				if ( strncmp( timebuf_low, dbResult[(i+1)*nColumn+2], 19 ) > 0  ) {
+					continue;
+				}
+
+				if ( strncmp( timebuf_high, dbResult[(i+1)*nColumn+2], 19 ) < 0  ) {
+					continue;
+				}
+				pItem->type = atoi(dbResult[(i+1)*nColumn+1]);
+				
+				sscanf(dbResult[(i+1)*nColumn+2], "%04d-%02d-%02d-%02d-%02d-%02d", &pItem->time.year,&pItem->time.mon, &pItem->time.day, 
+					&pItem->time.hour, &pItem->time.min, &pItem->time.sec);
+				Printf("%04d-%02d-%02d-%02d-%02d-%02d \n",pItem->time.year,pItem->time.mon, pItem->time.day, 
+					pItem->time.hour, pItem->time.min, pItem->time.sec);
+				Printf("type = %d \n",pItem->type);
+				pItem++;
+				num++;
+				
+			}
+			Printf("num = %d \n",num);
+			ret = sizeof(sdk_log_item_t)*num;
+			
+		}
+		else
+		{
+			Printf("err_msg = %s \n",err_msg);
+			ret = -1;
+		}
+		
+	}
+	else if(subType == SDK_LOG_EMPTY || subType == SDK_LOG_DEL)
+	{
+		sprintf(sql_cmd, "select * from logInfo2");
+		result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+		if(SQLITE_OK == result)
+		{
+			int i = 0;
+			int idx = 0;
+			for(i=0;i<nRow;i++)
+			{
+				idx = atoi(dbResult[(i+1)*nColumn]);
+				sprintf(sql_cmd,"delete from logInfo2 where idx=%d",idx);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, &err_msg))
+				{
+					Printf("err_msg = %s \n",err_msg);
+					//return -1;
+					ret = -1;
+					goto end;
+				}
+				
+			}
+		}
+		ret = 0;
+	}
+	/*
+	else if(subType == SDK_LOG_DEL)
+	{
+
+	}
+	*/
+	else if(subType == 0)
+	{
+		unsigned int first_id = 0;
+		unsigned int last_id = 0;
+		struct tm *ptm;
+		time_t tnow;
+			
+		sprintf(sql_cmd, "select * from logInfo2");
+		result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+		if(SQLITE_OK == result)
+		{
+			
+			if(nRow >= 1)
+				last_id = atoi(dbResult[(nRow)*nColumn]);
+			else
+				last_id = -1;
+			Printf("nRow = %d,last_id =%d,nColumn=%d \n",nRow,last_id,nColumn);
+			if(nRow >= 256)
+			{
+				first_id = atoi(dbResult[nColumn]);
+				Printf("first_id =%d \n",first_id);
+				sprintf(sql_cmd,"delete from logInfo2 where idx=%d",first_id);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, &err_msg))
+				{
+					Printf("err_msg = %s \n",err_msg);
+					//return -1;
+					ret = -1;
+					goto end;
+				}
+			}
+			
+
+			tnow = time(NULL);	
+			ptm = localtime(&tnow);
+			sprintf(st,"%04d-%02d-%02d-%02d-%02d-%02d",ptm->tm_year+1900, ptm->tm_mon+1, ptm->tm_mday,ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+			sprintf(sql_cmd,"INSERT INTO logInfo2 VALUES (%d,%d,\"%s\");",last_id+1,*(int*)pRecvData,st);
+			Printf("sql_cmd = %s \n",sql_cmd);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, &err_msg))
+			{
+				Printf("err_msg = %s \n",err_msg);
+				//return -1;
+				ret = -1;
+				goto end;
+			}
+		}
+		else
+		{
+		}
+	}
+
+end:
+	sqlite3_exec(db, "commit transaction", NULL, NULL, NULL);
+	if(ret == -1)
+	{
+		sqlite3_exec(db, "rollback transaction", NULL, NULL, NULL);
+		ret = -1;
+	}
+
+	/*  */
+	sqlite3_close(db);
+
+	pthread_mutex_unlock(&databaseMutex);
+	return ret;
+}
+
+static int db_op_default(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[1024] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	int init_mode = 0;
+	
+	sdk_default_param_t *p_cfg = (sdk_default_param_t *)pRecvData;
+	int channel = *(int *)data;
+	
+
+	Printf("param_mask 0x%08x \n", p_cfg->param_mask);
+
+	if((p_cfg->param_mask & (0x01<<SDK_PARAM_MASK_ENCODE)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_PTZ)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_RECORD)) > 0)
+	{
+		Printf("reset record cfg \n");
+		#if 1
+		for(j = 0; (j < MAX_DISPLAY_NUM) && (j < configGetDisplayNum()); j++)
+		{
+			sprintf(sql_cmd,"update RecordChannelInfo set enable=0, preRecord=0 where channelNo=%d", j);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+
+			for(i = 0; i < 7; i++)
+			{
+				sprintf(sql_cmd,"update RecordChannelTime set allDay=0, \
+						enable0=0, startHour0=0, startMin0=0, stopHour0=0, stopMin0=0, \
+						enable1=0, startHour1=0, startMin1=0, stopHour1=0, stopMin1=0, \
+						enable2=0, startHour2=0, startMin2=0, stopHour2=0, stopMin2=0, \
+						enable3=0, startHour3=0, startMin3=0, stopHour3=0, stopMin3=0 \
+						where channelNo=%d and weekday=%d",
+						j, i);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+				{
+					Printf("sqlite3_exec error\r\n");
+					ret = -1;
+				}
+			}
+		}
+		#endif
+		Printf("clear record cfg end \n");
+		g_rec_cfg_flag = 0;
+	}
+#if 1//
+	if(((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_NET)) > 0) && (p_cfg->param_mask != 0xFFFF))
+	{
+		Printf("reset network \n");
+		sprintf(sql_cmd,"update networkInfo set ip_addr='%s', netmask='%s', gateway='%s', dns1='%s', dns2='%s', enable_dhcp=%d where rowId=1",
+				DEFAULT_IP, DEFAULT_MASK, DEFAULT_GW, DEFAULT_DNS1, DEFAULT_DNS2, 0);
+		if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+		{
+			Printf("sqlite3_exec error\r\n");
+			ret = -1;
+		}
+		else
+		{
+			netSetIp("eth0", inet_addr((char *)DEFAULT_IP));
+			netSetMask("eth0", inet_addr((char *)DEFAULT_MASK));
+			netSetGw("eth0", inet_addr((char *)DEFAULT_GW));
+			netSetRoute("eth0", inet_addr((char *)DEFAULT_GW));
+			netSetDns(inet_addr((char *)DEFAULT_DNS1), inet_addr((char *)DEFAULT_DNS2));
+		}
+		g_eth_cfg_flag = 0;
+
+		sprintf(sql_cmd,"update netManageInfo set def_if_no=%d, multicast_addr='%s', net_mm_server='%s', net_mm_port=%d, http_port=%d, dvr_cmd_port=%d, dvr_data_port=%d where rowId=1",
+				DEFAULT_ETH0_NO, DEFAULT_MULTICAST_ADDR, DEFAULT_SERVER_ADDR, DEFAULT_PLAYBACK_PORT, DEFAULT_HTTP_PORT, DEFAULT_PLAYBACK_PORT, DEFAULT_RTSP_PORT);
+
+		if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+		{
+			Printf("sqlite3_exec error\r\n");
+			ret = -1;
+		}
+		g_net_mng_cfg_flag = 0;
+	}
+#endif
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_CHANNEL)) > 0)
+	{
+		sdk_channel_t ch_cfg;
+		Printf("reset chl cfg \n");
+		if(channel == 0xFA)
+		{
+			for(i = 0; i < MAX_DISPLAY_NUM; i++)
+			{
+				sprintf(sql_cmd,"update devChannelInfo set enable=0, channelName='', streamNo=0, addr='', port=0, userName='', userPwd='', protocol=0 where channelNo=%d", i);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+				{
+					Printf("sqlite3_exec error\r\n");
+					ret = -1;
+				}
+				memset(&ch_cfg, 0, sizeof(sdk_channel_t));
+				ch_cfg.chann_no = i;
+				appStartDecodeChannel(&ch_cfg);
+			}
+			g_ch_cfg_flag = 0;
+		}
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_IMAGE_ATTR)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_SERIAL)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_OVERLAY)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_MOTION)) > 0)
+	{
+		Printf("reset md cfg,channel =0x%02x \n",channel);
+		if(channel == 0xFA)
+		{
+			for(j = 0; j < MAX_DISPLAY_NUM; j++)
+			{
+				memset(sql_cmd,0,sizeof(sql_cmd));
+				sprintf(sql_cmd," update motionDetect set motionEnable=0,beepEnable=0,beepTime=1,recordEnable=0,recordTime=15,smtpEnable=0,ftpEnable=0,sensitivity=0 where channel=%d",j);
+				if(sqlite3_exec(db,sql_cmd,NULL,NULL,NULL) != SQLITE_OK)
+				{
+					printf("insert failed \n");
+				}
+			}
+			memset((char*)g_md_cfg,0,sizeof(g_md_cfg));
+		}
+		else
+		{
+			if(channel <0 || channel >= MAX_DISPLAY_NUM)
+				return -1;
+			memset(sql_cmd,0,sizeof(sql_cmd));
+			sprintf(sql_cmd," update motionDetect set motionEnable=0,beepEnable=0,beepTime=1,recordEnable=0,recordTime=15,smtpEnable=0,ftpEnable=0,sensitivity=0 where channel=%d",channel);
+			if(sqlite3_exec(db,sql_cmd,NULL,NULL,NULL) != SQLITE_OK)
+			{
+				printf("insert failed \n");
+			}
+			memset((char*)&g_md_cfg[channel],0,sizeof(sdk_motion_cfg_v2_t));	
+		}
+		g_comm_cfg_flag = 0;
+
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_COMM)) > 0)
+	{
+		sprintf(sql_cmd, "update CommCfginfo set language=%d, recycleRecord=%d, dvrId=%d,outDevice=%d, videoMode=%d, resolution=%d, standbyTime=%d", 1, 0, 0, 2, 1, 1, 30);
+		if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+		{
+			Printf("sqlite3_exec error\r\n");
+			ret = -1;
+		}
+		g_comm_cfg_flag = 0;
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_OSD)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_USER)) > 0)
+	{
+		sprintf(sql_cmd, "select * from userInfo");
+		result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+		if(SQLITE_OK == result)
+		{
+			index = nColumn;// nColumn 
+
+			for (i = 0; i < nRow; i++)
+			{
+				if(memcmp(dbResult[(i + 1) * nColumn + 0], "admin", strlen("admin")) == 0)
+				{
+					sprintf(sql_cmd, "update userInfo set userPwd='12345', localRight=4294967295, remoteRight=4294967295 where userName='%s'", "admin");
+				}
+				else
+				{
+					sprintf(sql_cmd, "delete from userInfo where userName='%s'", dbResult[(i + 1) * nColumn + 0]);
+				}
+
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+				{
+					Printf("sqlite3_exec error\r\n");
+					ret = -1;
+				}
+			}
+		}
+
+		sqlite3_free_table(dbResult);
+	}
+	if((p_cfg->param_mask & (0x01 <<SDK_PARAM_MASK_ALARM_IN)) > 0)
+	{
+		for(j = 0; j < configGetAlarmInNum(); j++)
+		{
+			channel = j;
+			sprintf(sql_cmd,"update AlarmInfo set enable=%d, type=%d, enableAlarmOut=%d, alarmOutChannel=%d, alarmOutTime=%d, enableRecord=%d, recordChannel=%d, recordTime=%d where alarmInNo=%d",
+					0, 0,
+					0, 0, 10,
+					0, 0, 10, channel);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+			else
+			{
+				for(i = 0; i < 7; i++)
+				{
+					sprintf(sql_cmd, "update AlarmTime set \
+							enable0=%d, startHour0=%d, startMin0=%d, stopHour0=%d, stopMin0=%d, \
+							enable1=%d, startHour1=%d, startMin1=%d, stopHour1=%d, stopMin1=%d, \
+							enable2=%d, startHour2=%d, startMin2=%d, stopHour2=%d, stopMin2=%d, \
+							enable3=%d, startHour3=%d, startMin3=%d, stopHour3=%d, stopMin3=%d \
+							where alarmInNo=%d and weekday=%d",
+							0, 0, 0, 0, 0,
+							0, 0, 0, 0, 0,
+							0, 0, 0, 0, 0,
+							0, 0, 0, 0, 0,
+							channel, i);
+					if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						Printf("sqlite3_exec error\r\n");
+						ret = -1;
+					}
+				}
+			}
+
+			if(ret != -1)
+			{
+				alarmSetUpdateParamFlag();
+				g_alarm_cfg_flag[channel] = 0;
+			}
+		}
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_HIDE)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_VIDEO_LOST)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_TV)) > 0)
+	{
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_PREVIEW)) > 0)
+	{
+		sprintf(sql_cmd,"update displayInfo set displayNum=%d, enableViceScreen=%d", 255, 0);
+		if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+		{
+			Printf("sqlite3_exec error\r\n");
+			ret = -1;
+		}
+
+		if(configGetDisplayNum() == 32)		init_mode = 7;
+		else if(configGetDisplayNum() == 25)	init_mode = 6;
+		else if(configGetDisplayNum() == 16)	init_mode = 5;
+		else if(configGetDisplayNum() == 9)	init_mode = 4;
+		else if(configGetDisplayNum() == 8)	init_mode = 3;
+		else if(configGetDisplayNum() == 6)	init_mode = 2;
+		else if(configGetDisplayNum() == 4)	init_mode = 1;
+		else if(configGetDisplayNum() == 1)	init_mode = 0;
+		else					init_mode = 0;
+
+		for(i = 0; (i < MAX_DISPLAY_NUM) && (i < configGetDisplayNum()); i++)
+		{
+			if(init_mode == 0)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos1=%d where channelNo=%d", i, i);
+			}
+			else if(init_mode == 1)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos4=%d where channelNo=%d", i, i);
+			}
+			else if(init_mode == 2)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos6=%d where channelNo=%d", i, i);
+			}
+			else if(init_mode == 3)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos8=%d where channelNo=%d", i, i);
+			}
+			else if(init_mode == 4)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos9=%d where channelNo=%d", i, i);
+			}
+			else if(init_mode == 5)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos16=%d where channelNo=%d", i, i);
+			}
+			else if(init_mode == 6)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos25=%d where channelNo=%d", i, i);
+			}
+			else if(init_mode == 7)
+			{
+				sprintf(sql_cmd,"update viewPosInfo set pos32=%d where channelNo=%d", i, i);
+			}
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+		}
+		g_pre_cfg_flag = 0;
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_NETWORK))>0)
+	{
+		system("cp /mnt/system.db   /data/system.db   -f \n");
+	}
+	if((p_cfg->param_mask & (0x01 << SDK_PARAM_MASK_TOUR)) > 0)
+	{
+	}
+	return ret;
+}
+
+static int db_op_chlcfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	if ( SDK_PARAM_SET == subType )
+	{ 
+		sdk_channel_t ch_cfg;
+		sdk_channel_t *p_cfg = (sdk_channel_t *)pRecvData;
+		int channel = *(int *)data;
+		Printf("channel = %d \n",channel);
+		if(channel == CHANN_TYPE_ALL)
+		{
+			for(j = 0; (j < MAX_DISPLAY_NUM) && (j < configGetDisplayNum()); j++)
+			{
+				if((g_ch_cfg_flag == 0) || (memcmp(p_cfg, &g_ch_cfg[j], sizeof(sdk_channel_t)) != 0))
+				{
+					memset(&ch_cfg, 0, sizeof(sdk_channel_t));
+					memcpy(&ch_cfg, p_cfg, sizeof(sdk_channel_t));
+
+					sprintf(sql_cmd,"update devChannelInfo set enable=%d, channelName='%s', streamNo=%d, addr='%s', port=%d, userName='%s', userPwd='%s', protocol=%d where channelNo=%d",
+							ch_cfg.enable, ch_cfg.name, ch_cfg.chann_win_mode, ch_cfg.device.ip_addr, ch_cfg.device.port,
+							ch_cfg.user.user_name, ch_cfg.user.user_pwd, ch_cfg.device.manufacturer, j);
+					//printf("sssssss sql_cmd = (%s)\r\n", sql_cmd);
+					if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						Printf("sqlite3_exec error\r\n");
+						ret = -1;
+					}
+					else
+					{
+						ch_cfg.chann_no = j;
+						ch_cfg.chann_win_mode = ch_cfg.chann_win_mode;
+						memcpy(&g_ch_cfg[j], &ch_cfg, sizeof(sdk_channel_t));
+						appStartDecodeChannel(&ch_cfg);
+					}
+				}
+			}
+			recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+		}
+		else
+		{
+			//printf("sssssssssssss g_ch_cfg_flag = %d, enable = %d.%d\r\n", g_ch_cfg_flag, p_cfg->enable, g_ch_cfg[channel].enable);
+			if((g_ch_cfg_flag == 0) || (memcmp(p_cfg, &g_ch_cfg[channel], sizeof(sdk_channel_t)) != 0))
+			{
+				memset(&ch_cfg, 0, sizeof(sdk_channel_t));
+				memcpy(&ch_cfg, p_cfg, sizeof(sdk_channel_t));
+
+				sprintf(sql_cmd,"update devChannelInfo set enable=%d, channelName='%s', streamNo=%d, addr='%s', port=%d, userName='%s', userPwd='%s', protocol=%d where channelNo=%d",
+						ch_cfg.enable, ch_cfg.name, ch_cfg.chann_win_mode, ch_cfg.device.ip_addr, ch_cfg.device.port,
+						ch_cfg.user.user_name, ch_cfg.user.user_pwd, ch_cfg.device.manufacturer, channel);
+				//printf("sssssss sql_cmd = (%s)\r\n", sql_cmd);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+				{
+					Printf("sqlite3_exec error\r\n");
+					ret = -1;
+				}
+				else
+				{
+					ch_cfg.chann_no = channel;
+					ch_cfg.chann_win_mode = ch_cfg.chann_win_mode;
+					memcpy(&g_ch_cfg[channel], &ch_cfg, sizeof(sdk_channel_t));
+					appStartDecodeChannel(&ch_cfg);
+					recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+				}
+			}
+		}
+	}
+	else
+	{
+		sdk_channel_t *p_cfg = (sdk_channel_t *)pRecvData;
+		int channel = *(int *)data;
+		//Printf("channel = %d \n",channel);
+		if(channel == CHANN_TYPE_ALL)
+		{
+			if(g_ch_cfg_flag == 0)
+			{
+				sprintf(sql_cmd, "select * from devChannelInfo");
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+
+					for(i = 0; (i < nRow) && (i < configGetDisplayNum() && i < MAX_DISPLAY_NUM); i++)
+					{
+						memset(&g_ch_cfg[i], 0, sizeof(sdk_channel_t));
+
+						g_ch_cfg[i].enable = atoi(dbResult[(i + 1) * nColumn + 0]);
+						g_ch_cfg[i].is_local = 0;
+						strcpy((char *)g_ch_cfg[i].name, dbResult[(i + 1) * nColumn + 1]);
+						g_ch_cfg[i].chann_no = atoi(dbResult[(i + 1) * nColumn + 2]);
+						g_ch_cfg[i].chann_win_mode = atoi(dbResult[(i + 1) * nColumn + 3]);
+						strcpy((char *)g_ch_cfg[i].device.ip_addr, dbResult[(i + 1) * nColumn + 4]);
+						g_ch_cfg[i].device.port = atoi(dbResult[(i + 1) * nColumn + 5]);
+						g_ch_cfg[i].device.device_type = 0;
+						strcpy((char *)g_ch_cfg[i].user.user_name, dbResult[(i + 1) * nColumn + 6]);
+						strcpy((char *)g_ch_cfg[i].user.user_pwd, dbResult[(i + 1) * nColumn + 7]);
+						g_ch_cfg[i].device.manufacturer = atoi(dbResult[(i + 1) * nColumn + 8]);
+//								printf("1  user_name == (%s)(%s)\r\n", g_ch_cfg[i].device.user.user_name, g_ch_cfg[i].device.user.user_pwd);
+
+						memcpy((char *)p_cfg + ret, &g_ch_cfg[i], sizeof(sdk_channel_t));
+						ret += sizeof(sdk_channel_t);
+					}
+					g_ch_cfg_flag = 1;
+				}
+				else
+				{
+				}
+
+				sqlite3_free_table(dbResult);
+			}
+			else
+			{
+				memcpy((char *)p_cfg, &g_ch_cfg, sizeof(g_ch_cfg));
+				ret = configGetDisplayNum() * sizeof(sdk_channel_t);
+			}
+		}
+		else
+		{
+			//if(channel >= MAX_DISPLAY_NUM || channel >= configGetDisplayNum())
+			//	break;
+			if(g_ch_cfg_flag == 0)
+			{
+				sprintf(sql_cmd, "select * from devChannelInfo where channelNo=%d", channel);
+
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+
+					for(i = 0; i < nRow; i++)
+					{
+						memset(&g_ch_cfg[channel], 0, sizeof(sdk_channel_t));
+
+						g_ch_cfg[channel].enable = atoi(dbResult[(i + 1) * nColumn + 0]);
+						g_ch_cfg[channel].is_local = 0;
+						strcpy((char *)g_ch_cfg[channel].name, dbResult[(i + 1) * nColumn + 1]);
+						g_ch_cfg[channel].chann_no = channel;
+						g_ch_cfg[i].chann_win_mode = atoi(dbResult[(i + 1) * nColumn + 3]);
+						strcpy((char *)g_ch_cfg[channel].device.ip_addr, dbResult[(i + 1) * nColumn + 4]);
+						g_ch_cfg[channel].device.port = atoi(dbResult[(i + 1) * nColumn + 5]);
+						g_ch_cfg[channel].device.device_type = 0;
+						strcpy((char *)g_ch_cfg[channel].user.user_name, dbResult[(i + 1) * nColumn + 6]);
+						strcpy((char *)g_ch_cfg[channel].user.user_pwd, dbResult[(i + 1) * nColumn + 7]);
+						g_ch_cfg[channel].device.manufacturer = atoi(dbResult[(i + 1) * nColumn + 8]);
+						printf("2  user_name == (%s)(%s)\r\n", g_ch_cfg[channel].device.user.user_name, g_ch_cfg[channel].device.user.user_pwd);
+
+						memcpy(p_cfg, &g_ch_cfg[channel], sizeof(sdk_channel_t));
+						ret = sizeof(sdk_channel_t);
+						break;
+					}
+				}
+
+				sqlite3_free_table(dbResult);
+			}
+			else
+			{
+				memcpy(p_cfg, &g_ch_cfg[channel], sizeof(sdk_channel_t));
+			}
+
+			ret = sizeof(sdk_channel_t);
+		}
+
+		//break;
+	}
+	return ret;
+}
+
+static int db_op_syscfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	if(SDK_PARAM_SET == subType)
+	{
+	}
+	else
+	{
+		sdk_sys_cfg_t *p_cfg = (sdk_sys_cfg_t *)pRecvData;
+
+		if(g_sys_cfg_flag == 0)
+		{
+			memset(&g_sys_cfg, 0, sizeof(sdk_sys_cfg_t));
+			sprintf(sql_cmd, "select * from SystemInfo");
+			printf("ccccccccccccc  (%s)\r\n", sql_cmd);
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;// nColumn 
+
+				for(i = 0; i < nRow; i++)
+				{
+					g_sys_cfg.dev_type = atoi(dbResult[index + 0]);
+					g_sys_cfg.ip_chan_num = configGetDisplayNum() > MAX_DISPLAY_NUM ? MAX_DISPLAY_NUM : configGetDisplayNum();//atoi(dbResult[index + 1]);
+					g_sys_cfg.alarm_in_num = configGetAlarmInNum();
+					g_sys_cfg.alarm_out_num = configGetAlarmOutNum();
+
+					memcpy(p_cfg, &g_sys_cfg, sizeof(sdk_sys_cfg_t));
+					g_sys_cfg_flag = 1;
+					break;
+				}
+			}
+			sqlite3_free_table(dbResult);
+		}
+		else
+		{
+			memcpy(p_cfg, &g_sys_cfg, sizeof(sdk_sys_cfg_t));
+		}
+
+		ret = sizeof(sdk_sys_cfg_t);
+	}
+	return ret;
+}
+
+static int db_op_reccfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_record_cfg_t *p_cfg = (sdk_record_cfg_t *)pRecvData;
+	int channel = *(int *)data;
+
+	if ( SDK_PARAM_SET == subType )
+	{
+		if(channel == CHANN_TYPE_ALL)
+		{
+			for(j = 0; (j < MAX_DISPLAY_NUM) && (j < configGetDisplayNum()); j++)
+			{
+				if((g_rec_cfg_flag == 0) || (memcmp(&p_cfg, &g_rec_cfg[j], sizeof(sdk_record_cfg_t)) != 0))
+				{
+					sprintf(sql_cmd,"update RecordChannelInfo set enable=%d, preRecord=%d where channelNo=%d", p_cfg->enable, p_cfg->pre_record_time, j);
+					if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						Printf("sqlite3_exec error\r\n");
+						ret = -1;
+					}
+
+					for(i = 0; i < 7; i++)
+					{
+						sprintf(sql_cmd,"update RecordChannelTime set allDay=%d, \
+								enable0=%d, startHour0=%d, startMin0=%d, stopHour0=%d, stopMin0=%d, \
+								enable1=%d, startHour1=%d, startMin1=%d, stopHour1=%d, stopMin1=%d, \
+								enable2=%d, startHour2=%d, startMin2=%d, stopHour2=%d, stopMin2=%d, \
+								enable3=%d, startHour3=%d, startMin3=%d, stopHour3=%d, stopMin3=%d \
+								where channelNo=%d and weekday=%d",
+								p_cfg->record_sched[i].is_allday,
+								p_cfg->record_sched[i].sched_time[0].enable,
+								p_cfg->record_sched[i].sched_time[0].start_hour, p_cfg->record_sched[i].sched_time[0].start_min,
+								p_cfg->record_sched[i].sched_time[0].stop_hour, p_cfg->record_sched[i].sched_time[0].stop_min,
+								p_cfg->record_sched[i].sched_time[1].enable,
+								p_cfg->record_sched[i].sched_time[1].start_hour, p_cfg->record_sched[i].sched_time[1].start_min,
+								p_cfg->record_sched[i].sched_time[1].stop_hour, p_cfg->record_sched[i].sched_time[1].stop_min,
+								p_cfg->record_sched[i].sched_time[2].enable,
+								p_cfg->record_sched[i].sched_time[2].start_hour, p_cfg->record_sched[i].sched_time[2].start_min,
+								p_cfg->record_sched[i].sched_time[2].stop_hour, p_cfg->record_sched[i].sched_time[2].stop_min,
+								p_cfg->record_sched[i].sched_time[3].enable,
+								p_cfg->record_sched[i].sched_time[3].start_hour, p_cfg->record_sched[i].sched_time[3].start_min,
+								p_cfg->record_sched[i].sched_time[3].stop_hour, p_cfg->record_sched[i].sched_time[3].stop_min,
+								j, i);
+						if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+						{
+							Printf("sqlite3_exec error\r\n");
+							ret = -1;
+						}
+						else
+						{
+							memcpy(&g_rec_cfg[j], &p_cfg, sizeof(sdk_record_cfg_t));
+						}
+					}
+				}
+			}
+
+			if(ret != -1)
+			{
+				recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+			}
+		}
+		else
+		{
+			Printf("g_rec_cfg_flag = %d,channel = %d \n",g_rec_cfg_flag,channel);
+			if((g_rec_cfg_flag == 0) || (memcmp(p_cfg, &g_rec_cfg[channel], sizeof(sdk_record_cfg_t)) != 0))
+			{
+				sprintf(sql_cmd,"update RecordChannelInfo set enable=%d, preRecord=%d where channelNo=%d", p_cfg->enable, p_cfg->pre_record_time, channel);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+				{
+					Printf("sqlite3_exec error\r\n");
+					ret = -1;
+				}
+
+				for(i = 0; i < 7; i++)
+				{
+					sprintf(sql_cmd,"update RecordChannelTime set allDay=%d, \
+							enable0=%d, startHour0=%d, startMin0=%d, stopHour0=%d, stopMin0=%d, \
+							enable1=%d, startHour1=%d, startMin1=%d, stopHour1=%d, stopMin1=%d, \
+							enable2=%d, startHour2=%d, startMin2=%d, stopHour2=%d, stopMin2=%d, \
+							enable3=%d, startHour3=%d, startMin3=%d, stopHour3=%d, stopMin3=%d \
+							where channelNo=%d and weekday=%d",
+							p_cfg->record_sched[i].is_allday,
+							p_cfg->record_sched[i].sched_time[0].enable,
+							p_cfg->record_sched[i].sched_time[0].start_hour, p_cfg->record_sched[i].sched_time[0].start_min,
+							p_cfg->record_sched[i].sched_time[0].stop_hour, p_cfg->record_sched[i].sched_time[0].stop_min,
+							p_cfg->record_sched[i].sched_time[1].enable,
+							p_cfg->record_sched[i].sched_time[1].start_hour, p_cfg->record_sched[i].sched_time[1].start_min,
+							p_cfg->record_sched[i].sched_time[1].stop_hour, p_cfg->record_sched[i].sched_time[1].stop_min,
+							p_cfg->record_sched[i].sched_time[2].enable,
+							p_cfg->record_sched[i].sched_time[2].start_hour, p_cfg->record_sched[i].sched_time[2].start_min,
+							p_cfg->record_sched[i].sched_time[2].stop_hour, p_cfg->record_sched[i].sched_time[2].stop_min,
+							p_cfg->record_sched[i].sched_time[3].enable,
+							p_cfg->record_sched[i].sched_time[3].start_hour, p_cfg->record_sched[i].sched_time[3].start_min,
+							p_cfg->record_sched[i].sched_time[3].stop_hour, p_cfg->record_sched[i].sched_time[3].stop_min,
+							channel, i);
+					if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						Printf("sqlite3_exec error\r\n");
+						ret = -1;
+					}
+					else
+					{
+						memcpy(&g_rec_cfg[j], &p_cfg[j], sizeof(sdk_record_cfg_t));
+					}
+				}
+				recordSetUpdateFlag(RECORD_UPDATE_FLAG_PARAM, 0, RECORD_UPDATE_FLAG_PARAM);
+			}
+		}
+	}
+	else
+	{
+		Printf("get rec cfg \n");
+		if(channel == CHANN_TYPE_ALL)
+		{
+			if(g_rec_cfg_flag == 0)
+			{
+				sprintf(sql_cmd, "select * from RecordChannelInfo");
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+
+					for(i = 0; (i < nRow) && (i < configGetDisplayNum()); i++)
+					{
+						g_rec_cfg[i].enable = atoi(dbResult[(i + 1) * nColumn + 0]);
+						g_rec_cfg[i].pre_record_time = atoi(dbResult[(i + 1) * nColumn + 2]);
+					}
+				}
+				sqlite3_free_table(dbResult);
+
+				sprintf(sql_cmd, "select * from RecordChannelTime");
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+
+					for(i = 0; (i < nRow) && (i < configGetDisplayNum()); i++)
+					{
+						int weekday = atoi(dbResult[(i + 1) * nColumn + 2]);
+						g_rec_cfg[i].record_sched[weekday].is_allday = atoi(dbResult[(i + 1) * nColumn + 3]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[0].enable = atoi(dbResult[(i + 1) * nColumn + 4]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[0].start_hour = atoi(dbResult[(i + 1) * nColumn + 5]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[0].start_min = atoi(dbResult[(i + 1) * nColumn + 6]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[0].stop_hour = atoi(dbResult[(i + 1) * nColumn + 7]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[0].stop_min = atoi(dbResult[(i + 1) * nColumn + 8]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[1].enable = atoi(dbResult[(i + 1) * nColumn + 9]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[1].start_hour = atoi(dbResult[(i + 1) * nColumn + 10]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[1].start_min = atoi(dbResult[(i + 1) * nColumn + 11]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[1].stop_hour = atoi(dbResult[(i + 1) * nColumn + 12]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[1].stop_min = atoi(dbResult[(i + 1) * nColumn + 13]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[2].enable = atoi(dbResult[(i + 1) * nColumn + 14]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[2].start_hour = atoi(dbResult[(i + 1) * nColumn + 15]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[2].start_min = atoi(dbResult[(i + 1) * nColumn + 16]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[2].stop_hour = atoi(dbResult[(i + 1) * nColumn + 17]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[2].stop_min = atoi(dbResult[(i + 1) * nColumn + 18]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[3].enable = atoi(dbResult[(i + 1) * nColumn + 19]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[3].start_hour = atoi(dbResult[(i + 1) * nColumn + 20]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[3].start_min = atoi(dbResult[(i + 1) * nColumn + 21]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[3].stop_hour = atoi(dbResult[(i + 1) * nColumn + 22]);
+						g_rec_cfg[i].record_sched[weekday].sched_time[3].stop_min = atoi(dbResult[(i + 1) * nColumn + 23]);
+
+						memcpy((char *)p_cfg + ret, &g_rec_cfg[i], sizeof(sdk_record_cfg_t));
+						ret += sizeof(sdk_record_cfg_t);
+					}
+
+					g_rec_cfg_flag = 1;
+				}
+
+				sqlite3_free_table(dbResult);
+			}
+			else
+			{
+				memcpy((char *)p_cfg, &g_rec_cfg, sizeof(g_rec_cfg));
+				ret += sizeof(g_rec_cfg);
+			}
+		}
+		else
+		{
+			if(g_rec_cfg_flag == 0)
+			{
+				sprintf(sql_cmd, "select * from RecordChannelInfo where channelNo=%d", channel);
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+
+					for(i = 0; i < nRow; i++)
+					{
+						p_cfg->enable = atoi(dbResult[index + 0]);
+						p_cfg->pre_record_time = atoi(dbResult[index + 2]);
+					}
+
+				}
+
+				sqlite3_free_table(dbResult);
+
+				sprintf(sql_cmd, "select * from RecordChannelTime where channelNo=%d", channel);
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;// nColumn 
+
+					for(i = 0; (i < nRow) && (i < 7); i++)
+					{
+						p_cfg->record_sched[i].is_allday = atoi(dbResult[(i + 1) * nColumn + 3]);
+						p_cfg->record_sched[i].sched_time[0].enable = atoi(dbResult[(i + 1) * nColumn + 4]);
+						p_cfg->record_sched[i].sched_time[0].start_hour = atoi(dbResult[(i + 1) * nColumn + 5]);
+						p_cfg->record_sched[i].sched_time[0].start_min = atoi(dbResult[(i + 1) * nColumn + 6]);
+						p_cfg->record_sched[i].sched_time[0].stop_hour = atoi(dbResult[(i + 1) * nColumn + 7]);
+						p_cfg->record_sched[i].sched_time[0].stop_min = atoi(dbResult[(i + 1) * nColumn + 8]);
+						p_cfg->record_sched[i].sched_time[1].enable = atoi(dbResult[(i + 1) * nColumn + 9]);
+						p_cfg->record_sched[i].sched_time[1].start_hour = atoi(dbResult[(i + 1) * nColumn + 10]);
+						p_cfg->record_sched[i].sched_time[1].start_min = atoi(dbResult[(i + 1) * nColumn + 11]);
+						p_cfg->record_sched[i].sched_time[1].stop_hour = atoi(dbResult[(i + 1) * nColumn + 12]);
+						p_cfg->record_sched[i].sched_time[1].stop_min = atoi(dbResult[(i + 1) * nColumn + 13]);
+						p_cfg->record_sched[i].sched_time[2].enable = atoi(dbResult[(i + 1) * nColumn + 14]);
+						p_cfg->record_sched[i].sched_time[2].start_hour = atoi(dbResult[(i + 1) * nColumn + 15]);
+						p_cfg->record_sched[i].sched_time[2].start_min = atoi(dbResult[(i + 1) * nColumn + 16]);
+						p_cfg->record_sched[i].sched_time[2].stop_hour = atoi(dbResult[(i + 1) * nColumn + 17]);
+						p_cfg->record_sched[i].sched_time[2].stop_min = atoi(dbResult[(i + 1) * nColumn + 18]);
+						p_cfg->record_sched[i].sched_time[3].enable = atoi(dbResult[(i + 1) * nColumn + 19]);
+						p_cfg->record_sched[i].sched_time[3].start_hour = atoi(dbResult[(i + 1) * nColumn + 20]);
+						p_cfg->record_sched[i].sched_time[3].start_min = atoi(dbResult[(i + 1) * nColumn + 21]);
+						p_cfg->record_sched[i].sched_time[3].stop_hour = atoi(dbResult[(i + 1) * nColumn + 22]);
+						p_cfg->record_sched[i].sched_time[3].stop_min = atoi(dbResult[(i + 1) * nColumn + 23]);
+					}
+					ret = sizeof(sdk_record_cfg_t);
+				}
+
+				sqlite3_free_table(dbResult);
+			}
+			else
+			{
+				memcpy((char *)p_cfg, &g_rec_cfg[channel], sizeof(sdk_record_cfg_t));
+				ret = sizeof(sdk_record_cfg_t);
+			}
+		}
+		//break;
+		Printf("ret = %d \n",ret);
+	}
+	return ret;
+}
+
+static int db_op_precfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_preview_t *p_cfg = (sdk_preview_t *)pRecvData;
+
+	if(SDK_PARAM_SET == subType)
+	{
+		if((g_pre_cfg_flag == 0) || (memcmp(p_cfg, &g_pre_cfg, sizeof(sdk_preview_t)) != 0))
+		{
+			sprintf(sql_cmd,"update displayInfo set displayNum=%d, enableViceScreen=%d", p_cfg->init_mode, p_cfg->enable);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+
+			if(configGetDisplayNum() == 32)	p_cfg->init_mode = 7;
+			else if(configGetDisplayNum() == 25)	p_cfg->init_mode = 6;
+			else if(configGetDisplayNum() == 16)	p_cfg->init_mode = 5;
+			else if(configGetDisplayNum() == 9)	p_cfg->init_mode = 4;
+			else if(configGetDisplayNum() == 8)	p_cfg->init_mode = 3;
+			else if(configGetDisplayNum() == 6)	p_cfg->init_mode = 2;
+			else if(configGetDisplayNum() == 4)	p_cfg->init_mode = 1;
+			else if(configGetDisplayNum() == 1)	p_cfg->init_mode = 0;
+			else				p_cfg->init_mode = 0;
+
+			/*  */
+			char tmpValue[MAX_DISPLAY_NUM] = {0};
+			for(i = 0; (i < MAX_DISPLAY_NUM) && (i < configGetDisplayNum()); i++)
+			{
+				if(tmpValue[p_cfg->windows[p_cfg->init_mode][i]] == 1)
+				{
+					ret = -1;
+					break;
+				}
+				tmpValue[p_cfg->windows[p_cfg->init_mode][i]] = 1;
+			}
+			if(ret == -1)
+			{
+				//break;
+				return ret;
+			}
+
+			for(i = 0; (i < MAX_DISPLAY_NUM) && (i < configGetDisplayNum()); i++)
+			{
+				if(p_cfg->init_mode == 0)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos1=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				else if(p_cfg->init_mode == 1)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos4=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				else if(p_cfg->init_mode == 2)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos6=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				else if(p_cfg->init_mode == 3)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos8=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				else if(p_cfg->init_mode == 4)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos9=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				else if(p_cfg->init_mode == 5)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos16=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				else if(p_cfg->init_mode == 6)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos25=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				else if(p_cfg->init_mode == 7)
+				{
+					sprintf(sql_cmd,"update viewPosInfo set pos32=%d where channelNo=%d", p_cfg->windows[p_cfg->init_mode][i], i);
+				}
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+				{
+					Printf("sqlite3_exec error\r\n");
+					ret = -1;
+				}
+			}
+
+			if(ret != -1)
+			{
+				memcpy(&g_pre_cfg, p_cfg, sizeof(sdk_preview_t));
+				g_pre_cfg_flag = 1;
+			}
+		}
+	}
+	else
+	{
+		if(g_pre_cfg_flag == 0)
+		{
+			memset(&g_pre_cfg, 0, sizeof(sdk_preview_t));
+			sprintf(sql_cmd, "select * from displayInfo");
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;// nColumn 
+
+				for(i = 0; i < nRow; i++)
+				{
+					g_pre_cfg.init_mode = atoi(dbResult[index + 0]);
+					g_pre_cfg.enable = atoi(dbResult[index + 1]);
+				}
+
+			}
+			else
+			{
+				ret = -1;
+			}
+			sqlite3_free_table(dbResult);
+
+			sprintf(sql_cmd, "select * from viewPosInfo");
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;// nColumn 
+
+				for(i = 0; (i < nRow) && (i < MAX_DISPLAY_NUM) && (i < configGetDisplayNum()); i++)
+				{
+					for(j = 0; j < MAX_PREVIEW_MODE; j++)
+					{
+						g_pre_cfg.windows[j][i] = atoi(dbResult[(i + 1) * nColumn + 1 + j]);
+					}
+				}
+
+				memcpy(p_cfg, &g_pre_cfg, sizeof(sdk_preview_t));
+				ret = sizeof(sdk_preview_t);
+			}
+			else
+			{
+				ret = -1;
+			}
+			sqlite3_free_table(dbResult);
+
+			if(ret != -1)
+			{
+				g_pre_cfg_flag = 1;
+			}
+		}
+		else
+		{
+			memcpy(p_cfg, &g_pre_cfg, sizeof(sdk_preview_t));
+			ret = sizeof(sdk_preview_t);
+		}
+
+		//break;
+	}
+	return ret;
+}
+
+static int db_op_commcfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_comm_cfg_t *p_cfg = (sdk_comm_cfg_t*)pRecvData;
+	//Printf("type = %d,subtype = %d,g_comm_cfg.resolution=%d,MAX_DISPLAY_NUM=%d \n",type,subType,g_comm_cfg.resolution,MAX_DISPLAY_NUM);
+	if(subType == SDK_PARAM_SET)
+	{
+		if((g_comm_cfg_flag == 0) || (memcmp(p_cfg, &g_comm_cfg, sizeof(sdk_comm_cfg_t)) != 0))
+		{
+			sprintf(sql_cmd,"update CommCfginfo set language=%d, recycleRecord=%d, dvrId=%d,outDevice=%d, videoMode=%d, resolution=%d, standbyTime=%d",
+					p_cfg->language,p_cfg->recycle_record,p_cfg->dvr_id,p_cfg->out_device, p_cfg->video_mode,p_cfg->resolution,p_cfg->standby_time);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+			else
+			{
+				memcpy(&g_comm_cfg, p_cfg, sizeof(sdk_comm_cfg_t));
+				g_comm_cfg_flag = 1;
+			}
+		}
+	}
+	else
+	{
+		if(g_comm_cfg_flag == 0)
+		{
+			memset(&g_comm_cfg, 0, sizeof(sdk_comm_cfg_t));
+			sprintf(sql_cmd, "select * from CommCfgInfo ");
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;
+				for(i = 0; i < nRow; i++)
+				{
+					g_comm_cfg.language=atoi(dbResult[index + 0]);
+					g_comm_cfg.recycle_record=atoi(dbResult[index + 1]);
+					g_comm_cfg.dvr_id=atoi(dbResult[index + 2]);
+					g_comm_cfg.out_device=atoi(dbResult[index + 3]);
+					g_comm_cfg.video_mode=atoi(dbResult[index + 4]);
+					g_comm_cfg.resolution=atoi(dbResult[index + 5]);
+					g_comm_cfg.standby_time=atoi(dbResult[index + 6]);
+				}
+				memcpy(p_cfg, &g_comm_cfg, sizeof(sdk_comm_cfg_t));
+				ret = sizeof(sdk_comm_cfg_t);
+				g_comm_cfg_flag = 1;
+			}
+			else
+			{
+				Printf("select common cfg fail\r\n");
+			}
+
+			sqlite3_free_table(dbResult);
+		}
+		else
+		{
+			memcpy(p_cfg, &g_comm_cfg, sizeof(sdk_comm_cfg_t));
+			ret = sizeof(sdk_comm_cfg_t);
+		}
+	}
+	return ret;
+}
+
+static int db_op_ethcfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_eth_cfg_t *p_eth_cfg = (sdk_eth_cfg_t *)pRecvData;
+			
+	unsigned int IpAddr[2];
+	//unsigned int GateWay[2] ;
+	unsigned char mac[6] = { 0 };
+	char GateWay[256] = {0};
+	char Dns1[40] = {0}, Dns2[40] = {0};
+	char NetMask[40] = {0}; 
+	struct in_addr addr;
+	if(SDK_PARAM_SET == subType)
+	{
+		if((g_eth_cfg_flag == 0) || (memcmp(p_eth_cfg, &g_eth_cfg, sizeof(sdk_eth_cfg_t)) != 0) || (p_eth_cfg->ip_info.enable_dhcp == 1))
+		{
+			sprintf(sql_cmd,"update networkInfo set ip_addr='%s', netmask='%s', gateway='%s', mac='%s', dns1='%s', dns2='%s', enable_dhcp=%d where rowId=1",
+				p_eth_cfg->ip_info.ip_addr, p_eth_cfg->ip_info.mask, p_eth_cfg->ip_info.gateway, p_eth_cfg->ip_info.mac, p_eth_cfg->ip_info.dns1, p_eth_cfg->ip_info.dns2, p_eth_cfg->ip_info.enable_dhcp);
+
+			if (SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+			else
+			{
+
+				#if 1
+                                  if(p_eth_cfg->ip_info.enable_dhcp)// 使能了DHCP
+                                  {		 
+                                         
+					//system("/app/bin/udhcpc &");
+					system("/usr/share/udhcpc/udhcpc &");
+					usleep(1200*1000);
+					system("killall -9 udhcpc");
+					GetIpResult = netGetIp("eth0", IpAddr);
+					if(GetIpResult == 0)//DHCP自动获取成功，则从网卡或配置文件中读取网络数据，保存到数据库中，同时刷新监控屏的网络数据。
+					{
+						  memset(p_eth_cfg,0,sizeof(p_eth_cfg));						  
+						  // 获取本地IP地址
+						  GetIpResult = netGetIp("eth0", IpAddr);						  
+						  memcpy(&addr, &IpAddr, 4); 
+                                                  sprintf(p_eth_cfg->ip_info.ip_addr,"%s",inet_ntoa((struct in_addr)addr));
+						  // 获取网关IP地址
+                                                  netGetGw(GateWay);
+						  sprintf(p_eth_cfg->ip_info.gateway,"%s", GateWay);
+						  Printf("===GateWay======:%s\n\n",GateWay);
+						  Printf("======GateWay:%s\n\n",p_eth_cfg->ip_info.gateway);
+						  
+						  // 获取掩码
+						  GetNetMask("eth0", NetMask);
+						  sprintf(p_eth_cfg->ip_info.mask,"%s", NetMask);
+						  // 获取DNS
+						  GetDNSAddr(Dns1, Dns2);
+						  sprintf(p_eth_cfg->ip_info.dns1,"%s", Dns1);
+						  sprintf(p_eth_cfg->ip_info.dns2,"%s", Dns2);
+							  
+                                                  memcpy(&g_eth_cfg, p_eth_cfg, sizeof(sdk_eth_cfg_t));
+						  sprintf(sql_cmd,"update networkInfo set ip_addr='%s', netmask='%s', gateway='%s', mac='%s', dns1='%s', dns2='%s', enable_dhcp=%d where rowId=1",
+				p_eth_cfg->ip_info.ip_addr, p_eth_cfg->ip_info.mask, p_eth_cfg->ip_info.gateway, p_eth_cfg->ip_info.mac, p_eth_cfg->ip_info.dns1, p_eth_cfg->ip_info.dns2, p_eth_cfg->ip_info.enable_dhcp);
+                                                  if (SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			                       {
+				                        Printf("sqlite3_exec error\r\n");
+				                        ret = -1;
+			                       }			  
+					}
+					else // DHCP获取失败，则从数据库中读取网络参数，并保存到网卡中
+					{
+                                                sprintf(sql_cmd, "select * from networkInfo");
+						result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+						if (SQLITE_OK == result)
+						{
+						      
+							index = nColumn;// nColumn 
+							strncpy((char *)g_eth_cfg.ip_info.if_name, dbResult[ index + 0], sizeof(g_eth_cfg.ip_info.if_name) - 1 );
+							strncpy((char *)g_eth_cfg.ip_info.ip_addr, dbResult[ index + 1], sizeof(g_eth_cfg.ip_info.ip_addr ) - 1 );	
+							strncpy((char *)g_eth_cfg.ip_info.mask, dbResult[ index + 2], sizeof(g_eth_cfg.ip_info.mask) - 1);
+							strncpy((char *)g_eth_cfg.ip_info.gateway, dbResult[ index + 3], sizeof(g_eth_cfg.ip_info.gateway) -1  );
+							//net_get_hwaddr("eth0", mac);
+							netGetMac("eth0", mac);
+
+							sprintf((char *)g_eth_cfg.ip_info.mac, "%02X-%02X-%02X-%02X-%02X-%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+							if(dbResult[ index + 5])
+							{
+								strncpy((char *)g_eth_cfg.ip_info.dns1, dbResult[ index + 5], sizeof(g_eth_cfg.ip_info.dns1) - 1 );
+							}
+							if(dbResult[ index + 6])
+							{
+								strncpy((char *)g_eth_cfg.ip_info.dns2, dbResult[ index + 6], sizeof(g_eth_cfg.ip_info.dns2) - 1 );
+							}
+
+							g_eth_cfg.ip_info.enable_dhcp = (int)atoi(dbResult[ index + 7]);
+							g_eth_cfg.if_mode = 0;
+							memcpy(p_eth_cfg, &g_eth_cfg, sizeof(sdk_eth_cfg_t));
+							ret = sizeof(sdk_eth_cfg_t);
+							
+					              // 将网络数据保存到网卡中
+							netSetIp("eth0", inet_addr((char *)p_eth_cfg->ip_info.ip_addr));
+							netSetMask("eth0", inet_addr((char *)p_eth_cfg->ip_info.mask));
+							netSetGw("eth0", inet_addr((char *)p_eth_cfg->ip_info.gateway));
+							netSetRoute("eth0", inet_addr((char *)p_eth_cfg->ip_info.gateway));
+							//SetDns((char *)p_eth_cfg->ip_info.dns1, (char *)p_eth_cfg->ip_info.dns2);
+							netSetDns(inet_addr((char *)p_eth_cfg->ip_info.dns1), inet_addr((char *)p_eth_cfg->ip_info.dns2));
+
+							memcpy(&g_eth_cfg, p_eth_cfg, sizeof(sdk_eth_cfg_t));
+
+						}
+
+						sqlite3_free_table(dbResult);	
+						  
+					}
+					
+				}
+				else // 没有使能dhcp
+				{
+					#if 1
+					netSetIp("eth0", inet_addr((char *)p_eth_cfg->ip_info.ip_addr));
+					netSetMask("eth0", inet_addr((char *)p_eth_cfg->ip_info.mask));
+					netSetGw("eth0", inet_addr((char *)p_eth_cfg->ip_info.gateway));
+					netSetRoute("eth0", inet_addr((char *)p_eth_cfg->ip_info.gateway));
+					//SetDns((char *)p_eth_cfg->ip_info.dns1, (char *)p_eth_cfg->ip_info.dns2);
+					netSetDns(inet_addr((char *)p_eth_cfg->ip_info.dns1), inet_addr((char *)p_eth_cfg->ip_info.dns2));
+
+					memcpy(&g_eth_cfg, p_eth_cfg, sizeof(sdk_eth_cfg_t));
+					g_eth_cfg_flag = 1;
+					#endif
+				}
+				#endif
+			}
+		}
+
+		ret = 0;
+	}
+	else   // 获取
+	{
+		if(g_eth_cfg_flag == 0)
+		{
+			sprintf(sql_cmd, "select * from networkInfo");
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if (SQLITE_OK == result)
+			{
+			      
+				index = nColumn;// nColumn 
+
+				for (i = 0; i < nRow; i++)
+				{
+					strncpy((char *)g_eth_cfg.ip_info.if_name, dbResult[ index + 0], sizeof(g_eth_cfg.ip_info.if_name) - 1 );
+					strncpy((char *)g_eth_cfg.ip_info.ip_addr, dbResult[ index + 1], sizeof(g_eth_cfg.ip_info.ip_addr ) - 1 );	
+					strncpy((char *)g_eth_cfg.ip_info.mask, dbResult[ index + 2], sizeof(g_eth_cfg.ip_info.mask) - 1);
+					strncpy((char *)g_eth_cfg.ip_info.gateway, dbResult[ index + 3], sizeof(g_eth_cfg.ip_info.gateway) -1  );
+
+					unsigned char mac[6] = { 0 };
+					//net_get_hwaddr("eth0", mac);
+					netGetMac("eth0", mac);
+
+					sprintf((char *)g_eth_cfg.ip_info.mac, "%02X-%02X-%02X-%02X-%02X-%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+					if(dbResult[ index + 5])
+					{
+						strncpy((char *)g_eth_cfg.ip_info.dns1, dbResult[ index + 5], sizeof(g_eth_cfg.ip_info.dns1) - 1 );
+					}
+					if(dbResult[ index + 6])
+					{
+						strncpy((char *)g_eth_cfg.ip_info.dns2, dbResult[ index + 6], sizeof(g_eth_cfg.ip_info.dns2) - 1 );
+					}
+
+					g_eth_cfg.ip_info.enable_dhcp = (int)atoi(dbResult[ index + 7]);
+					g_eth_cfg.if_mode = 0;
+					memcpy(p_eth_cfg, &g_eth_cfg, sizeof(sdk_eth_cfg_t));
+
+					g_eth_cfg_flag = 1;
+
+					break;	
+				}
+
+				ret = sizeof(sdk_eth_cfg_t);
+			}
+
+			printf("222 GET if_idx = 0, ip:%s, mask:%s, gateway:%s, mac:%s if_name:%s\n",
+					p_eth_cfg->ip_info.ip_addr, p_eth_cfg->ip_info.mask, p_eth_cfg->ip_info.gateway, p_eth_cfg->ip_info.mac, p_eth_cfg->ip_info.if_name);
+			sqlite3_free_table(dbResult);	
+		}
+		else
+		{
+			memcpy(p_eth_cfg, &g_eth_cfg, sizeof(sdk_eth_cfg_t));
+			ret = sizeof(sdk_eth_cfg_t);
+		}
+	}
+	//Printf("333333GET if_idx = 0, ip:%s, mask:%s, gateway:%s, mac:%s\n,if_name:%s,,ip_info.dns1:%s,ip_info.dns2:%s,dhcp:%d\n",
+	//				p_eth_cfg->ip_info.ip_addr, p_eth_cfg->ip_info.mask, p_eth_cfg->ip_info.gateway, p_eth_cfg->ip_info.mac, p_eth_cfg->ip_info.if_name, p_eth_cfg->ip_info.dns1, p_eth_cfg->ip_info.dns2, p_eth_cfg->ip_info.enable_dhcp);
+	return ret;
+}
+
+static int db_op_netcfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_net_mng_cfg_t *p_net_mng = (sdk_net_mng_cfg_t*)pRecvData;
+	unsigned int Brocast[2] = {0};
+	unsigned int IpAddr[2];
+	struct in_addr addr;
+	if(SDK_PARAM_SET == subType)
+	{ 
+	#if 1
+                   if(g_eth_cfg.ip_info.enable_dhcp == 1) // DHCP使能，从网卡中获取广播地址
+	      {
+			  if(GetIpResult  == 0)
+			  {
+				  // 获取广播地址
+				  netGetBro("eth0", Brocast);
+				  memcpy(&addr, &Brocast, 4); 
+                                 sprintf(p_net_mng->multicast,"%s",inet_ntoa((struct in_addr)addr));
+			  }
+		}
+				   #endif
+		if((g_net_mng_cfg_flag == 0) || (memcmp(p_net_mng, &g_net_mng_cfg, sizeof(sdk_net_mng_cfg_t)) != 0) ||(g_eth_cfg.ip_info.enable_dhcp == 1))
+		{
+			sprintf(sql_cmd,"update netManageInfo set def_if_no=%d, multicast_addr='%s', net_mm_server='%s', net_mm_port=%d, http_port=%d, dvr_cmd_port=%d, dvr_data_port=%d where rowId=1",
+					p_net_mng->def_if_no, p_net_mng->multicast, p_net_mng->net_manager, p_net_mng->net_manager_port, p_net_mng->http_port, p_net_mng->dvr_cmd_port, p_net_mng->dvr_data_port);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+			else
+			{
+				if(p_net_mng->dvr_cmd_port != g_net_mng_cfg.dvr_cmd_port)
+				{
+					playbackRemoteUpdateParam();
+				}
+				if(p_net_mng->dvr_data_port != g_net_mng_cfg.dvr_data_port)
+				{
+					rtspServerUpdateParam();
+				}
+				if(p_net_mng->http_port != g_net_mng_cfg.http_port)
+				{
+					//boaUpdateParam();
+					commonSetUpdataBoaParamFlag(1);
+				}
+
+				memcpy(&g_net_mng_cfg, p_net_mng, sizeof(sdk_net_mng_cfg_t));
+				g_net_mng_cfg_flag = 1;
+			}
+		}
+
+		ret = 0;
+	}
+	else
+	{
+		if(g_net_mng_cfg_flag == 0)
+		{
+			sprintf(sql_cmd, "select * from netManageInfo");
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;// nColumn 
+
+				for (i = 0; i < nRow; i++)
+				{
+					g_net_mng_cfg.def_if_no = (uint16_t)atoi(dbResult[ index + 0]);	
+					strncpy((char *)g_net_mng_cfg.multicast, dbResult[ index + 1], sizeof(g_net_mng_cfg.multicast) - 1);
+					strncpy((char *)g_net_mng_cfg.net_manager, dbResult[ index + 2], sizeof( g_net_mng_cfg.net_manager) -1  );
+					g_net_mng_cfg.net_manager_port = (uint16_t)atoi(dbResult[ index + 3]);	
+
+					g_net_mng_cfg.http_port = (uint16_t)atoi(dbResult[ index + 4]);
+					g_net_mng_cfg.dvr_cmd_port = (uint16_t)atoi(dbResult[ index + 5]);
+					g_net_mng_cfg.dvr_data_port = (uint16_t)atoi(dbResult[ index + 6]);
+
+					memcpy(p_net_mng, &g_net_mng_cfg, sizeof(sdk_net_mng_cfg_t));
+					g_net_mng_cfg_flag = 1;
+					break;
+				}
+
+				ret = sizeof(sdk_net_mng_cfg_t);
+			}
+
+			sqlite3_free_table(dbResult);	
+		}
+		else
+		{
+			memcpy(p_net_mng, &g_net_mng_cfg, sizeof(sdk_net_mng_cfg_t));
+			ret = sizeof(sdk_net_mng_cfg_t);
+		}
+
+		Printf("222 GET def_if_no =%d, multicast:%s, net_manager:%s, net_manager_port:%d, http_port %d dvr_cmd_port %d dvr_data_port %d\n",
+				p_net_mng->def_if_no, p_net_mng->multicast, p_net_mng->net_manager, p_net_mng->net_manager_port, p_net_mng->http_port, p_net_mng->dvr_cmd_port, p_net_mng->dvr_data_port);
+	}
+	return ret;
+}
+
+static int db_op_alarmcfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_alarm_in_cfg_t *alarm_in_cfg = (sdk_alarm_in_cfg_t *)pRecvData;
+	int channel = *(int *)data;
+	unsigned int tmpValue = 0;
+	unsigned int tmpValueAlarm = 0, tmpValueRecord = 0;
+
+	if(subType == SDK_PARAM_SET)
+	{
+		if(channel == CHANN_TYPE_ALL)
+		{
+			for(j = 0; j < configGetAlarmInNum(); j++)
+			{
+				channel = j;
+				if((g_alarm_cfg_flag[channel] == 0) || (memcmp(alarm_in_cfg, &g_alarm_cfg[channel], sizeof(sdk_alarm_in_cfg_t)) != 0))
+				{
+					for(i = 0; i < configGetDisplayNum(); i++)
+					{
+						if(alarm_in_cfg->alarm_handle.alarm_out_mask[i] == 1)
+						{
+							tmpValueAlarm |= (1 << i);
+						}
+						if(alarm_in_cfg->alarm_handle.record_mask[i] == 1)
+						{
+							tmpValueRecord |= (1 << i);
+						}
+					}
+
+					sprintf(sql_cmd,"update AlarmInfo set enable=%d, type=%d, enableAlarmOut=%d, alarmOutChannel=%d, alarmOutTime=%d, enableRecord=%d, recordChannel=%d, recordTime=%d where alarmInNo=%d",
+							alarm_in_cfg->enable, alarm_in_cfg->type,
+							alarm_in_cfg->alarm_handle.alarm_out_enable, tmpValueAlarm, alarm_in_cfg->alarm_handle.alarm_out_time,
+							alarm_in_cfg->alarm_handle.record_enable, tmpValueRecord, alarm_in_cfg->alarm_handle.record_time, channel);
+					if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						Printf("sqlite3_exec error\r\n");
+						ret = -1;
+					}
+					else
+					{
+						for(i = 0; i < 7; i++)
+						{
+							sprintf(sql_cmd, "update AlarmTime set \
+									enable0=%d, startHour0=%d, startMin0=%d, stopHour0=%d, stopMin0=%d, \
+									enable1=%d, startHour1=%d, startMin1=%d, stopHour1=%d, stopMin1=%d, \
+									enable2=%d, startHour2=%d, startMin2=%d, stopHour2=%d, stopMin2=%d, \
+									enable3=%d, startHour3=%d, startMin3=%d, stopHour3=%d, stopMin3=%d \
+									where alarmInNo=%d and weekday=%d",
+									alarm_in_cfg->sched_time[i][0].enable,
+									alarm_in_cfg->sched_time[i][0].start_hour, alarm_in_cfg->sched_time[i][0].start_min,
+									alarm_in_cfg->sched_time[i][0].stop_hour, alarm_in_cfg->sched_time[i][0].stop_min,
+									alarm_in_cfg->sched_time[i][1].enable,
+									alarm_in_cfg->sched_time[i][1].start_hour, alarm_in_cfg->sched_time[i][1].start_min,
+									alarm_in_cfg->sched_time[i][1].stop_hour, alarm_in_cfg->sched_time[i][1].stop_min,
+									alarm_in_cfg->sched_time[i][2].enable,
+									alarm_in_cfg->sched_time[i][2].start_hour, alarm_in_cfg->sched_time[i][2].start_min,
+									alarm_in_cfg->sched_time[i][2].stop_hour, alarm_in_cfg->sched_time[i][2].stop_min,
+									alarm_in_cfg->sched_time[i][3].enable,
+									alarm_in_cfg->sched_time[i][3].start_hour, alarm_in_cfg->sched_time[i][3].start_min,
+									alarm_in_cfg->sched_time[i][3].stop_hour, alarm_in_cfg->sched_time[i][3].stop_min,
+									channel, i);
+							if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+							{
+								Printf("sqlite3_exec error\r\n");
+								ret = -1;
+							}
+						}
+					}
+
+					if(ret != -1)
+					{
+						memcpy(&g_alarm_cfg[channel], alarm_in_cfg, sizeof(sdk_alarm_in_cfg_t));
+						alarmSetUpdateParamFlag();
+						g_alarm_cfg_flag[channel] = 1;
+					}
+				}
+			}
+		}
+		else
+		{
+			if((g_alarm_cfg_flag[channel] == 0) || (memcmp(alarm_in_cfg, &g_alarm_cfg[channel], sizeof(sdk_alarm_in_cfg_t)) != 0))
+			{
+				for(i = 0; i < configGetDisplayNum(); i++)
+				{
+					if(alarm_in_cfg->alarm_handle.alarm_out_mask[i] == 1)
+					{
+						tmpValueAlarm |= (1 << i);
+					}
+					if(alarm_in_cfg->alarm_handle.record_mask[i] == 1)
+					{
+						tmpValueRecord |= (1 << i);
+					}
+				}
+
+				sprintf(sql_cmd,"update AlarmInfo set enable=%d, type=%d, enableAlarmOut=%d, alarmOutChannel=%d, alarmOutTime=%d, enableRecord=%d, recordChannel=%d, recordTime=%d where alarmInNo=%d",
+						alarm_in_cfg->enable, alarm_in_cfg->type,
+						alarm_in_cfg->alarm_handle.alarm_out_enable, tmpValueAlarm, alarm_in_cfg->alarm_handle.alarm_out_time,
+						alarm_in_cfg->alarm_handle.record_enable, tmpValueRecord, alarm_in_cfg->alarm_handle.record_time, channel);
+				if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+				{
+					Printf("sqlite3_exec error\r\n");
+					ret = -1;
+				}
+				else
+				{
+					for(i = 0; i < 7; i++)
+					{
+						sprintf(sql_cmd, "update AlarmTime set \
+								enable0=%d, startHour0=%d, startMin0=%d, stopHour0=%d, stopMin0=%d, \
+								enable1=%d, startHour1=%d, startMin1=%d, stopHour1=%d, stopMin1=%d, \
+								enable2=%d, startHour2=%d, startMin2=%d, stopHour2=%d, stopMin2=%d, \
+								enable3=%d, startHour3=%d, startMin3=%d, stopHour3=%d, stopMin3=%d \
+								where alarmInNo=%d and weekday=%d",
+								alarm_in_cfg->sched_time[i][0].enable,
+								alarm_in_cfg->sched_time[i][0].start_hour, alarm_in_cfg->sched_time[i][0].start_min,
+								alarm_in_cfg->sched_time[i][0].stop_hour, alarm_in_cfg->sched_time[i][0].stop_min,
+								alarm_in_cfg->sched_time[i][1].enable,
+								alarm_in_cfg->sched_time[i][1].start_hour, alarm_in_cfg->sched_time[i][1].start_min,
+								alarm_in_cfg->sched_time[i][1].stop_hour, alarm_in_cfg->sched_time[i][1].stop_min,
+								alarm_in_cfg->sched_time[i][2].enable,
+								alarm_in_cfg->sched_time[i][2].start_hour, alarm_in_cfg->sched_time[i][2].start_min,
+								alarm_in_cfg->sched_time[i][2].stop_hour, alarm_in_cfg->sched_time[i][2].stop_min,
+								alarm_in_cfg->sched_time[i][3].enable,
+								alarm_in_cfg->sched_time[i][3].start_hour, alarm_in_cfg->sched_time[i][3].start_min,
+								alarm_in_cfg->sched_time[i][3].stop_hour, alarm_in_cfg->sched_time[i][3].stop_min,
+								channel, i);
+						if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+						{
+							Printf("sqlite3_exec error\r\n");
+							ret = -1;
+						}
+					}
+				}
+
+				if(ret != -1)
+				{
+					memcpy(&g_alarm_cfg[channel], alarm_in_cfg, sizeof(sdk_alarm_in_cfg_t));
+					alarmSetUpdateParamFlag();
+				}
+			}
+		}
+	}
+	else
+	{
+		if(g_alarm_cfg_flag[channel] == 0)
+		{
+			sprintf(sql_cmd, "select * from AlarmInfo where alarmInNo=%d", channel);
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;
+				for(i = 0; i < nRow; i++)
+				{
+					g_alarm_cfg[channel].enable = atoi(dbResult[(i + 1) * nColumn + 1]);
+					g_alarm_cfg[channel].type = atoi(dbResult[(i + 1) * nColumn + 2]);
+
+					g_alarm_cfg[channel].alarm_handle.alarm_out_enable = atoi(dbResult[(i + 1) * nColumn + 3]);
+					tmpValue = atoi(dbResult[(i + 1) * nColumn + 4]);
+					for(j = 0; j < configGetDisplayNum(); j++)
+					{
+						if((tmpValue & (1 << j)) > 0)
+						{
+							g_alarm_cfg[channel].alarm_handle.alarm_out_mask[j] = 1;
+						}
+						else
+						{
+							g_alarm_cfg[channel].alarm_handle.alarm_out_mask[j] = 0;
+						}
+					}
+					g_alarm_cfg[channel].alarm_handle.alarm_out_time = atoi(dbResult[(i + 1) * nColumn + 5]);
+
+					g_alarm_cfg[channel].alarm_handle.record_enable = atoi(dbResult[(i + 1) * nColumn + 6]);
+					tmpValue = atoi(dbResult[(i + 1) * nColumn + 7]);
+					for(j = 0; j < configGetDisplayNum(); j++)
+					{
+						if((tmpValue & (1 << j)) > 0)
+						{
+							g_alarm_cfg[channel].alarm_handle.record_mask[j] = 1;
+						}
+						else
+						{
+							g_alarm_cfg[channel].alarm_handle.record_mask[j] = 0;
+						}
+					}
+					g_alarm_cfg[channel].alarm_handle.record_time = atoi(dbResult[(i + 1) * nColumn + 8]);
+				}
+
+				sqlite3_free_table(dbResult);
+
+				sprintf(sql_cmd, "select * from AlarmTime where alarmInNo=%d", channel);
+				result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+				if(SQLITE_OK == result)
+				{
+					index = nColumn;
+
+					for(i = 0; (i < nRow) && (i < 7); i++)
+					{
+						g_alarm_cfg[channel].sched_time[i][0].enable = atoi(dbResult[(i + 1) * nColumn + 2]);
+						g_alarm_cfg[channel].sched_time[i][0].start_hour = atoi(dbResult[(i + 1) * nColumn + 3]);
+						g_alarm_cfg[channel].sched_time[i][0].start_min = atoi(dbResult[(i + 1) * nColumn + 4]);
+						g_alarm_cfg[channel].sched_time[i][0].stop_hour = atoi(dbResult[(i + 1) * nColumn + 5]);
+						g_alarm_cfg[channel].sched_time[i][0].stop_min = atoi(dbResult[(i + 1) * nColumn + 6]);
+						g_alarm_cfg[channel].sched_time[i][1].enable = atoi(dbResult[(i + 1) * nColumn + 7]);
+						g_alarm_cfg[channel].sched_time[i][1].start_hour = atoi(dbResult[(i + 1) * nColumn + 8]);
+						g_alarm_cfg[channel].sched_time[i][1].start_min = atoi(dbResult[(i + 1) * nColumn + 9]);
+						g_alarm_cfg[channel].sched_time[i][1].stop_hour = atoi(dbResult[(i + 1) * nColumn + 10]);
+						g_alarm_cfg[channel].sched_time[i][1].stop_min = atoi(dbResult[(i + 1) * nColumn + 11]);
+						g_alarm_cfg[channel].sched_time[i][2].enable = atoi(dbResult[(i + 1) * nColumn + 12]);
+						g_alarm_cfg[channel].sched_time[i][2].start_hour = atoi(dbResult[(i + 1) * nColumn + 13]);
+						g_alarm_cfg[channel].sched_time[i][2].start_min = atoi(dbResult[(i + 1) * nColumn + 14]);
+						g_alarm_cfg[channel].sched_time[i][2].stop_hour = atoi(dbResult[(i + 1) * nColumn + 15]);
+						g_alarm_cfg[channel].sched_time[i][2].stop_min = atoi(dbResult[(i + 1) * nColumn + 16]);
+						g_alarm_cfg[channel].sched_time[i][3].enable = atoi(dbResult[(i + 1) * nColumn + 17]);
+						g_alarm_cfg[channel].sched_time[i][3].start_hour = atoi(dbResult[(i + 1) * nColumn + 18]);
+						g_alarm_cfg[channel].sched_time[i][3].start_min = atoi(dbResult[(i + 1) * nColumn + 19]);
+						g_alarm_cfg[channel].sched_time[i][3].stop_hour = atoi(dbResult[(i + 1) * nColumn + 20]);
+						g_alarm_cfg[channel].sched_time[i][3].stop_min = atoi(dbResult[(i + 1) * nColumn + 21]);
+					}
+				}
+				else
+				{
+					Printf("select alarm cfg fail\r\n");
+					ret = -1;
+				}
+
+				sqlite3_free_table(dbResult);
+
+				if(ret != -1)
+				{
+					g_alarm_cfg_flag[channel] = 1;
+					memcpy(alarm_in_cfg, &g_alarm_cfg[channel], sizeof(sdk_alarm_in_cfg_t));
+					ret = sizeof(sdk_alarm_in_cfg_t);
+				}
+			}
+			else
+			{
+				Printf("AAAAAAAAAa select alarm cfg fail\r\n");
+				ret = -1;
+				sqlite3_free_table(dbResult);
+			}
+		}
+		else
+		{
+			memcpy(alarm_in_cfg, &g_alarm_cfg[channel], sizeof(sdk_alarm_in_cfg_t));
+			ret = sizeof(sdk_alarm_in_cfg_t);
+		}
+	}
+	return ret;
+}
+
+static int db_op_ddnscfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_ddns_cfg_t *pDdns = (sdk_ddns_cfg_t *)pRecvData;
+
+			if(SDK_PARAM_SET == subType)
+			{
+				if((g_ddns_cfg_flag == 0) || (memcmp(pDdns, &g_ddns_cfg, sizeof(sdk_ddns_cfg_t)) != 0))
+				{
+					sprintf(sql_cmd, "update ddns set enable=%d, type=%d, interTime=%d, domain='%s', userName='%s', userPwd='%s', userType=%d",
+							pDdns->enable, pDdns->type, pDdns->interval, pDdns->domain, pDdns->user, pDdns->pwd, pDdns->user_type);
+					if (SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						perror("sqlite3_exec error");
+						ret = -1;
+					}
+					else
+					{
+						ddnsStart(1, pDdns);
+						memcpy(&g_ddns_cfg, pDdns, sizeof(sdk_ddns_cfg_t));
+						g_ddns_cfg_flag = 1;
+					}
+				}
+
+				ret = 0;					
+			}
+			else if(SDK_PARAM_GET == subType)
+			{
+				if(g_ddns_cfg_flag == 0)
+				{
+					sprintf(sql_cmd, "select * from ddns");
+					result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+					if(SQLITE_OK == result)
+					{
+						index = nColumn;// nColumn 
+
+						for(i = 0; i < nRow; i++)
+						{ 
+							memset(pDdns, 0, sizeof(sdk_ddns_cfg_t));
+							pDdns->enable = atoi(dbResult[nColumn + 0]);
+							pDdns->type = atoi(dbResult[nColumn + 1]);
+							pDdns->interval = atoi(dbResult[nColumn + 2]);
+							if(dbResult[nColumn + 3] != NULL)
+								strcpy(pDdns->domain, dbResult[nColumn + 3]);
+							if(dbResult[nColumn + 4] != NULL)
+								strcpy(pDdns->user, dbResult[nColumn + 4]);
+							if(dbResult[nColumn + 5] != NULL)
+								strcpy(pDdns->pwd, dbResult[nColumn + 5]);
+							pDdns->user_type = atoi(dbResult[nColumn + 6]);
+
+							memcpy(&g_ddns_cfg, pDdns, sizeof(sdk_ddns_cfg_t));
+							g_ddns_cfg_flag = 1;
+							ret = sizeof(sdk_ddns_cfg_t);
+
+							break;
+						}					
+					}
+					sqlite3_free_table(dbResult);
+				}
+				else
+				{
+					memcpy(pDdns, &g_ddns_cfg, sizeof(sdk_ddns_cfg_t));
+					ret = sizeof(sdk_ddns_cfg_t);
+				}
+			}
+			return ret;
+}
+
+static int db_op_upnpcfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	sdk_upnp_t *pUpnp = (sdk_upnp_t *)pRecvData;
+
+			if(SDK_PARAM_SET == subType)
+			{
+				if((g_upnp_cfg_flag == 0) || (memcmp(pUpnp, &g_upnp_cfg, sizeof(sdk_upnp_t)) != 0))
+				{
+					sprintf(sql_cmd, "update upnp set enable=%d, netType=%d, auto=%d, updateTime=%d, serverAddr='%s', cmdPort=%d, dataPort=%d, webPort=%d, resPort=%d",
+							pUpnp->enable, pUpnp->net_type, pUpnp->en_auto, pUpnp->time, pUpnp->server_ip, pUpnp->cmd_port, pUpnp->data_port, pUpnp->web_port, pUpnp->res_port);
+					if (SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+					{
+						perror("sqlite3_exec error");
+						ret = -1;
+					}
+					else
+					{
+						upnpStart(1, pUpnp);
+						memcpy(&g_upnp_cfg, pUpnp, sizeof(sdk_upnp_t));
+						g_upnp_cfg_flag = 1;
+					}
+				}
+
+				ret = 0;
+			}
+			else if(SDK_PARAM_GET == subType)
+			{
+				if(g_upnp_cfg_flag == 0)
+				{
+					sprintf(sql_cmd, "select * from upnp");
+					result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+					if(SQLITE_OK == result)
+					{
+						index = nColumn;// nColumn 
+
+						for(i = 0; i < nRow; i++)
+						{ 
+							memset(pUpnp, 0, sizeof(sdk_upnp_t));
+							pUpnp->enable = atoi(dbResult[nColumn + 0]);
+							pUpnp->net_type = atoi(dbResult[nColumn + 1]);
+							pUpnp->en_auto = atoi(dbResult[nColumn + 2]);
+							pUpnp->time = atoi(dbResult[nColumn + 3]);
+							strcpy(pUpnp->server_ip, dbResult[nColumn + 4]);
+							pUpnp->cmd_port = atoi(dbResult[nColumn + 5]);
+							pUpnp->data_port = atoi(dbResult[nColumn + 6]);
+							pUpnp->web_port = atoi(dbResult[nColumn + 7]);
+							pUpnp->res_port = atoi(dbResult[nColumn + 8]);
+
+							memcpy(&g_upnp_cfg, pUpnp, sizeof(sdk_upnp_t));
+							g_upnp_cfg_flag = 1;
+							ret = sizeof(sdk_upnp_t);
+
+							break;
+						}
+					}
+					sqlite3_free_table(dbResult);
+				}
+				else
+				{
+					memcpy(pUpnp, &g_upnp_cfg, sizeof(sdk_upnp_t));
+					ret = sizeof(sdk_upnp_t);
+				}
+			}
+			return ret;
+}
+
+
+static int db_op_disk(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	//int i = 0, j = 0;
+	//int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	//char sql_cmd[256] = {0,};
+	//int result = 0;
+	//char **dbResult; // char ** *
+	//int nRow = 0, nColumn = 0;//, nRow2;
+	
+	if ( SDK_DISK_QUERY == subType )
+	{
+		sdk_disk_t *pDisk = (sdk_disk_t *)pRecvData;
+		sata_info_t pSataInfo = { 0 };
+		int i = 0;
+
+		findSataDisk( &pSataInfo );
+
+		for ( i = 0; i < pSataInfo.diskNum; i++)
+		{
+			printf("sataPort %d devName %s size %llu G \n", 
+					pSataInfo.sataInfo[i].sataPort, pSataInfo.sataInfo[i].devName, pSataInfo.sataInfo[i].totalSize / 1000 / 1000 / 1000);
+			pDisk->disk_no = pSataInfo.sataInfo[i].sataPort;
+			pDisk->disk_type = (pDisk->disk_no >= 10 ) ? 1 : 0;
+			pDisk->status = SDK_DISK_STATUS_DISK_NOMAL;
+			pDisk->total_size = (int)(pSataInfo.sataInfo[i].totalSize / 1000 / 1000 );
+			if(pDisk->disk_no >= 10)
+			{						
+				pDisk->free_size = GetDiskFreeSize(pSataInfo.sataInfo[i].devName);
+			}
+			else
+			{
+				pDisk->status = recordGetDiskUsedStatus(pDisk->disk_no - 1);
+				pDisk->free_size = recordGetFreePercent(pDisk->disk_no - 1) * pDisk->total_size / 1000;
+			}
+			pDisk->is_backup = 0;
+			pDisk->is_raid = 0;	
+			pDisk++;
+		}
+
+		ret = pSataInfo.diskNum * sizeof(sdk_disk_t); 
+		printf(" %s %s sub_type SDK_MAIN_MSG_DISK \n", __FILE__, __FUNCTION__);	
+	}		 	
+	return ret;
+}
+
+
+static int db_op_cruise(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	int channel = *(int*)data;			
+	
+	sdk_cruise_param_t *pCruise = (sdk_cruise_param_t *)pRecvData;
+
+	if ( SDK_PARAM_GET == subType ) {
+		sprintf(sql_cmd, "select * from ptzCruiseInfo where channel=%d ", channel+1);
+		result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+		if (SQLITE_OK == result)
+		{
+			index = nColumn;// nColumn 
+
+			for (i = 0; i < nRow; i++)
+			{ 
+				memset(pCruise, 0, sizeof(sdk_cruise_param_t));
+				pCruise->enable = atoi(dbResult[ index + 1]);
+
+				for (j = 0; j < MAX_CRUISE_PRESET_NUM; j++ ) {
+					pCruise->preset[j] = atoi(dbResult[ index + j * 3 + 3])	;
+					pCruise->speed[j] = atoi(dbResult[ index + j * 3 + 4]);	
+					pCruise->dwell_time[j] = atoi(dbResult[ index + j * 3 + 5]);								
+				}
+
+				break;
+			}					
+		}
+		sqlite3_free_table(dbResult);
+
+		ret = sizeof(sdk_cruise_param_t);					
+
+		//break;
+		return ret;
+	}
+
+	if ( SDK_PARAM_SET == subType ) {		
+
+		char tmp[4096];
+		char *p = tmp;			
+		for (j = 0; j < MAX_CRUISE_PRESET_NUM; j++ ) {
+			p += sprintf(p, ", presetNo%d=%d, speed%d=%d, dwellTime%d=%d" ,
+					j+1, pCruise->preset[j], j+1, pCruise->speed[j], j+1, pCruise->dwell_time[j]);						
+		}	
+
+		p = tmp;
+
+		sprintf(sql_cmd, "update ptzCruiseInfo set enable=%d%s where channel=%d ", pCruise->enable, p, channel+1);
+
+		if (SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+		{
+			perror("sqlite3_exec error");
+			ret = -1;
+		}					
+
+		ret = 0;					
+	}		
+	return ret;	
+}
+
+static int db_op_user(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	
+	switch(subType)
+	{
+		case SDK_USER_AAA:
+		{
+			printf("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n");
+			break;
+		}
+		case SDK_USER_ADD:
+		{
+			sdk_user_right_t *p_tmp = (sdk_user_right_t *)data;
+
+			sprintf(sql_cmd, "insert into userInfo (userName, userPwd, localRight, remoteRight) values ('%s', '%s', %u, %u)",
+					p_tmp->user.user_name, p_tmp->user.user_pwd, p_tmp->local_right, p_tmp->remote_right);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec");
+				ret = -1;
+			}
+
+			break;
+		}
+		case SDK_USER_DEL:
+		{
+			sdk_user_t *p_tmp = (sdk_user_t *)data;
+
+			sprintf(sql_cmd, "delete from userInfo where userName='%s'", p_tmp->user_name);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec");
+				ret = -1;
+			}
+
+			break;
+		}
+		case SDK_USER_MODI:
+		{
+			sdk_user_right_t *p_tmp = (sdk_user_right_t *)data;
+
+			sprintf(sql_cmd, "update userInfo set userPwd='%s', localRight=%u, remoteRight=%u where userName='%s'",
+					p_tmp->user.user_pwd, p_tmp->local_right, p_tmp->remote_right, p_tmp->user.user_name);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec");
+				ret = -1;
+			}
+			break;
+		}
+		case SDK_USER_QUERY:
+		{
+			sdk_user_right_t *p_tmp = (sdk_user_right_t *)pRecvData;
+
+			sprintf(sql_cmd, "select * from userInfo");
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;// nColumn 
+
+				for (i = 0; i < nRow; i++)
+				{
+					strcpy((char *)p_tmp[i].user.user_name, dbResult[(i + 1) * nColumn + 0]);
+					strcpy((char *)p_tmp[i].user.user_pwd, dbResult[(i + 1) * nColumn + 1]);
+					p_tmp[i].local_right = atoi(dbResult[(i + 1) * nColumn + 2]);
+					p_tmp[i].remote_right = atoi(dbResult[(i + 1) * nColumn + 3]);
+
+					ret += sizeof(sdk_user_right_t);											
+				}
+			}
+
+			sqlite3_free_table(dbResult);
+
+			break;
+		}
+		default:
+		{
+			printf("No operation!\n");
+			break;
+		}
+	}
+	return ret;
+}
+
+static int db_op_ntdcfg(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+	
+	
+	int ret = 0;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+	char *err_msg = NULL;
+	
+	//sdk_ntd_conf_t ntd_conf = {0,};
+	sdk_ntd_conf_t *p_ntd_conf = NULL;
+	if(subType == SDK_PARAM_SET)
+	{
+		p_ntd_conf = (sdk_ntd_conf_t*)pRecvData;
+		sprintf(sql_cmd,"update NtdCfg set timezone=%d, ntdserver='%s'  where idx=%d ", p_ntd_conf->time_zone,p_ntd_conf->ntd_server,0);
+		if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, &err_msg))
+		{
+			Printf("err_msg = %s \n",err_msg);
+			ret = -1;
+		}
+		SetNtpTime(p_ntd_conf->time_zone,p_ntd_conf->ntd_server);
+	}
+	else
+	{
+		sprintf(sql_cmd, "select * from NtdCfg");
+		result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+		if(SQLITE_OK == result)
+		{
+			//index = nColumn;// nColumn 
+			
+			p_ntd_conf = (sdk_ntd_conf_t*)pRecvData;
+			p_ntd_conf->time_zone = atoi(dbResult[nColumn+1]);
+			//p_ntd_conf->ntd_server = dbResult[2];
+			memcpy(p_ntd_conf->ntd_server,dbResult[nColumn+2],128);
+			ret = sizeof(sdk_ntd_conf_t);
+		}
+		else
+		{
+		}
+		sqlite3_free_table(dbResult);
+	}
+	return ret;
+}
+
+static int db_op_28181(sqlite3 *db,int subType,void *data, int len, void *pRecvData, int recvDataLen)
+{
+
+	int i = 0, j = 0;
+	int index = 0;
+	int ret = 0;
+	//sqlite3 *db;
+	char sql_cmd[512] = {0,};
+	int result = 0;
+	char **dbResult; // char ** *
+	int nRow = 0, nColumn = 0;//, nRow2;
+
+
+	sdk_28181_conf_t *p_cfg = (sdk_28181_conf_t*)pRecvData;
+
+	if(subType == SDK_PARAM_SET)
+	{
+		if((g_28181_cfg_flag == 0) || (memcmp(p_cfg, &g_28181_cfg, sizeof(sdk_28181_conf_t)) != 0))
+		{
+			sprintf(sql_cmd,"update gb28181 set enable=%d, serverIp='%s', serverPort=%d, serverId='%s', deviceId='%s', \
+					channelId1='%s', channelId2='%s', channelId3='%s', channelId4='%s', channelId5='%s', channelId6='%s', channelId7='%s', channelId8='%s', channelId9='%s', channelId10='%s', \
+					channelId11='%s', channelId12='%s', channelId13='%s', channelId14='%s', channelId15='%s', channelId16='%s', channelId17='%s', channelId18='%s', channelId19='%s', \
+					channelId20='%s', channelId21='%s', channelId22='%s', channelId23='%s', channelId24='%s', channelId25='%s', channelId26='%s', channelId27='%s', channelId28='%s', \
+					channelId29='%s', channelId30='%s', channelId31='%s', channelId32='%s', \
+					pwd='%s', alarmId='%s'",
+					p_cfg->enable, p_cfg->server_ip, p_cfg->server_port, p_cfg->server_id, p_cfg->device_id,
+					p_cfg->channel_nvr_id[0], p_cfg->channel_nvr_id[1], p_cfg->channel_nvr_id[2], p_cfg->channel_nvr_id[3], p_cfg->channel_nvr_id[4],
+					p_cfg->channel_nvr_id[5], p_cfg->channel_nvr_id[6], p_cfg->channel_nvr_id[7], p_cfg->channel_nvr_id[8], p_cfg->channel_nvr_id[9],
+					p_cfg->channel_nvr_id[10], p_cfg->channel_nvr_id[11], p_cfg->channel_nvr_id[12], p_cfg->channel_nvr_id[13], p_cfg->channel_nvr_id[14],
+					p_cfg->channel_nvr_id[15], p_cfg->channel_nvr_id[16], p_cfg->channel_nvr_id[17], p_cfg->channel_nvr_id[18], p_cfg->channel_nvr_id[19],
+					p_cfg->channel_nvr_id[20], p_cfg->channel_nvr_id[21], p_cfg->channel_nvr_id[22], p_cfg->channel_nvr_id[23], p_cfg->channel_nvr_id[24],
+					p_cfg->channel_nvr_id[25], p_cfg->channel_nvr_id[26], p_cfg->channel_nvr_id[27], p_cfg->channel_nvr_id[28], p_cfg->channel_nvr_id[29],
+					p_cfg->channel_nvr_id[30], p_cfg->channel_nvr_id[31],
+					p_cfg->pwd, p_cfg->alarm_id
+					);
+			if(SQLITE_OK != sqlite3_exec(db, sql_cmd, NULL, NULL, NULL))
+			{
+				Printf("sqlite3_exec error\r\n");
+				ret = -1;
+			}
+			else
+			{
+				memcpy(&g_28181_cfg, p_cfg, sizeof(sdk_28181_conf_t));
+				g_28181_cfg_flag = 1;
+				//TE_platUpdateParam();
+			}
+		}
+	}
+	else
+	{
+		if(g_28181_cfg_flag == 0)
+		{
+			memset(&g_28181_cfg, 0, sizeof(sdk_28181_conf_t));
+			sprintf(sql_cmd, "select * from gb28181");
+			result = sqlite3_get_table(db, sql_cmd, &dbResult, &nRow, &nColumn, NULL);
+			if(SQLITE_OK == result)
+			{
+				index = nColumn;
+				for(i = 0; i < nRow; i++)
+				{
+					g_28181_cfg.enable = atoi(dbResult[index + 0]);
+					if(dbResult[nColumn + 1] != NULL)
+						strcpy(g_28181_cfg.server_ip, dbResult[nColumn + 1]);
+					g_28181_cfg.server_port = atoi(dbResult[index + 2]);
+					if(dbResult[nColumn + 3] != NULL)
+						strcpy(g_28181_cfg.server_id, dbResult[nColumn + 3]);
+					if(dbResult[nColumn + 4] != NULL)
+						strcpy(g_28181_cfg.device_id, dbResult[nColumn + 4]);
+					for(j = 0; j < 32; j++)
+					{
+						if(dbResult[nColumn + 5 + j] != NULL)
+						{
+							strcpy(g_28181_cfg.channel_nvr_id[j], dbResult[nColumn + 5 + j]);
+						}
+					}
+					if(dbResult[nColumn + 37] != NULL)
+						strcpy(g_28181_cfg.pwd, dbResult[nColumn + 37]);
+					if(dbResult[nColumn + 38] != NULL)
+						strcpy(g_28181_cfg.alarm_id, dbResult[nColumn + 38]);
+				}
+				memcpy(p_cfg, &g_28181_cfg, sizeof(sdk_28181_conf_t));
+				ret = sizeof(sdk_28181_conf_t);
+				g_28181_cfg_flag = 1;
+			}
+			else
+			{
+				Printf("select common cfg fail\r\n");
+			}
+
+			sqlite3_free_table(dbResult);
+		}
+		else
+		{
+			memcpy(p_cfg, &g_28181_cfg, sizeof(sdk_28181_conf_t));
+			ret = sizeof(sdk_28181_conf_t);
+		}
+	}
+	return ret;
+}
+
+/*
+ * 
+ * type:	
+ * data:	
+ * len:		
+ * pRecvData:	buf
+ * recvDataLen:	buf
+ *
+ * 	
+ * */
+int databaseOperate(int type, int subType, void *data, int len, void *pRecvData, int recvDataLen)
+{
+	//int i = 0, j = 0;
+	//int index = 0;
+	int ret = 0;
+	sqlite3 *db;
+	//char sql_cmd[256] = {0,};
+	//int result = 0;
+	//char **dbResult; // char ** *
+	//int nRow = 0, nColumn = 0;//, nRow2;
+	//int init_mode = 0;
+
+	pthread_mutex_lock(&databaseMutex);
+
+	/**/
+	if(SQLITE_OK != sqlite3_open(DATABASE_FILE, &db))
+	{
+		sqlite3_close(db);
+		pthread_mutex_unlock(&databaseMutex);
+		return -1;
+		/*send error msg*/
+	}
+
+	//usleep(100*1000);
+	//Printf("type = %d,subtype = %d,g_comm_cfg.resolution=%d,MAX_DISPLAY_NUM=%d \n",type,subType,g_comm_cfg.resolution,MAX_DISPLAY_NUM);
+
+	sqlite3_exec(db, "begin transaction", NULL, NULL, NULL);
+
+//	printf("wwwwwwwwwwwwwwwww  type == %d, subType = %d\r\n", type, subType);
+	//Printf("type = %d,subtype = %d,g_comm_cfg.resolution=%d,MAX_DISPLAY_NUM=%d \n",type,subType,g_comm_cfg.resolution,MAX_DISPLAY_NUM);
+	/*  */
+	switch(type)
+	{
+		case SDK_MAIN_MSG_MOTION_CFG:
+		{
+			ret =  db_op_motion_detect(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+
+		}
+		case SDK_MAIN_MSG_PARAM_DEFAULT:
+		{
+			ret =  db_op_default(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_SYS_CFG:
+		{
+			ret =  db_op_syscfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_CHANN_CFG:
+		{
+			//break;
+			ret = db_op_chlcfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_RECORD_CFG:
+		{
+			ret = db_op_reccfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_PREVIEW_CFG:
+		{
+			ret = db_op_precfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_ALARM_IN_CFG:
+		{
+			ret = db_op_alarmcfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_COMM_CFG:
+		{
+			ret = db_op_commcfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_DISK:
+		{
+			ret = db_op_disk(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_NET_LINK_CFG:
+		{
+			ret = db_op_ethcfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_NET_MNG_CFG:
+		{
+			ret = db_op_netcfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_CRUISE_CFG:
+		{
+			ret = db_op_cruise(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_USER:
+		{
+			ret = db_op_user(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_DDNS_CFG:
+		{
+			ret = db_op_ddnscfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_UPNP_CFG:
+		{
+			ret = db_op_upnpcfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		}
+		case SDK_MAIN_MSG_28181:
+		{
+			ret = db_op_28181(db, subType, data, len, pRecvData, recvDataLen);			
+			break;
+		}
+		case SDK_MAIN_MSG_NTD:
+			ret = db_op_ntdcfg(db, subType, data, len, pRecvData, recvDataLen);
+			break;
+		default:
+		{
+			printf("database not support type %d\r\n", type);
+			break;
+		}
+	}
+
+	sqlite3_exec(db, "commit transaction", NULL, NULL, NULL);
+	if(ret == -1)
+	{
+		sqlite3_exec(db, "rollback transaction", NULL, NULL, NULL);
+		ret = -1;
+	}
+
+	/*  */
+	sqlite3_close(db);
+
+	pthread_mutex_unlock(&databaseMutex);
+
+	return ret;
+}
+
+

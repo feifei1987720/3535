@@ -1,0 +1,224 @@
+#include "playbackLib.h"
+#include "playbackFunc.h"
+#include "streamLib.h"
+#include "sdk_struct.h"
+#include "recordLib.h"
+#include "commonLib.h"
+#include "aviLib.h"
+#include "diskLib.h"
+#include "myThreadLib.h"
+
+typedef struct backup_file_t
+{
+	char aviFileName[256];
+	playback_file_info_t fileInfo;
+	int process;//
+}backup_file_t;
+
+
+static backup_file_t g_backup;
+
+
+/*  */
+void backupRecordThread(char *arg, int argLen)
+{
+	stream_frame_t *pFrame = NULL;
+	avi_t* pAviHandle;
+	int isSet = 0;//avi
+	int waitIFrame = 0;//I
+	int frameNo = 0;//
+	int frameRate = 0;//
+	int width = 0, height = 0;//
+	int count = 0;
+	int ret = 0;
+
+	pFrame = (stream_frame_t *)malloc(MAX_FRAME_BUFFER_LEN + sizeof(stream_frame_head_t));
+	if(pFrame == NULL)
+	{
+		perror("backup pFrame malloc");
+		exit(0);
+	}
+
+	pAviHandle = AVI_open_output_file(g_backup.aviFileName);
+	if(!pAviHandle)
+	{
+		Printf("avi file open failed ,filename = %s \r\n",g_backup.aviFileName);
+		ret = -1;
+		goto error;
+		
+	}
+
+	g_backup.process = 0;
+
+	while(1)
+	{
+		count++;
+
+		if((count%500) == 0)
+		{
+			myMsleep(30);
+			//usleep(10000);
+		}
+
+		ret = playbackRecordRead(&g_backup.fileInfo, 1, pFrame);
+		if(ret == 0)
+		{
+			if(waitIFrame == 0)
+			{
+				if((pFrame->pFrameBuf[4] & 0x1F) == NAL_TYPE_SPS)
+				{
+					waitIFrame = 1;
+					frameNo = pFrame->frameHead.frameNo;
+				}
+				else
+				{
+					continue;
+				}
+			}
+			else
+			{
+				if(((frameNo + 1)&0xFFFF) != pFrame->frameHead.frameNo)
+				{//I
+					Printf("backup record, lost frame %d ~ %d\r\n", frameNo, pFrame->frameHead.frameNo);
+					waitIFrame = 0;
+					continue;
+				}
+			}
+			frameNo = pFrame->frameHead.frameNo;
+
+			if(pFrame->frameHead.type == FRAME_TYPE_AUDIO)
+			{
+				if((isSet & 0x02) == 0)
+				{
+					AVI_set_audio(pAviHandle, 1, 8000, 16, WAVE_FORMAT_PCM);
+					isSet |= 0x02;
+				}
+				Printf("write audio \n");
+				AVI_write_audio(pAviHandle, pFrame->pFrameBuf, pFrame->frameHead.len);
+			}
+			else if(pFrame->frameHead.type == FRAME_TYPE_VIDEO)
+			{
+				if((isSet & 0x01) == 0)
+				{
+					width = pFrame->frameHead.info.video.width;
+					height = pFrame->frameHead.info.video.height;
+					frameRate = pFrame->frameHead.info.video.frameRate;
+
+					Printf("width === %d, height = %d, frameRate = %d\r\n", width, height, frameRate);
+					AVI_set_video(pAviHandle, width, height, frameRate, "h264");
+					isSet |= 0x01;
+				}
+				//Printf("write %d bytes data \n",pFrame->frameHead.len);
+				AVI_write_frame(pAviHandle, pFrame->pFrameBuf, pFrame->frameHead.len);
+			}
+
+			if((pFrame->pFrameBuf[4] & 0x1F) == NAL_TYPE_IDR)
+			{
+				g_backup.process = (g_backup.fileInfo.dataCurAddr - g_backup.fileInfo.dataStartAddr) / ((g_backup.fileInfo.dataEndAddr - g_backup.fileInfo.dataStartAddr) / 100);
+				//Printf("progress=%d,cur=%d,start=%d,end=%d len=%d \r\n", g_backup.process, g_backup.fileInfo.dataCurAddr,
+				//		g_backup.fileInfo.dataStartAddr, g_backup.fileInfo.dataEndAddr,g_backup.fileInfo.dataEndAddr - g_backup.fileInfo.dataStartAddr);
+			}
+		}
+		else if(ret == 1)
+		{
+			if((g_backup.fileInfo.dataCurAddr - g_backup.fileInfo.dataStartAddr) != (g_backup.fileInfo.dataEndAddr - g_backup.fileInfo.dataStartAddr))
+				ret = -2;
+			Printf("backup record success\r\n");
+			goto error;
+		}
+		else
+		{
+			Printf("backup record error\r\n");
+			ret = -2;
+			goto error;
+		}
+	}
+
+error:
+	if(pFrame != NULL)
+	{
+		free(pFrame);
+		pFrame = NULL;
+	}
+
+	playbackRecordClose(&g_backup.fileInfo);
+
+	if(pAviHandle != NULL)
+	{
+		AVI_close(pAviHandle);
+	}
+	if(1 == ret)
+		g_backup.process = 100;//success
+	else if(-1 == ret)
+		g_backup.process = 200;// write usb  failed
+	else if(-2 == ret)
+		g_backup.process = 300;//read record file failed 
+	else
+		g_backup.process = 400;//unkown error
+}
+
+/*  */
+int playbackStartBackupRecord(sdk_record_backup_t *pBackup)
+{
+	record_search_file_t file;
+	char diskPath[128] = {0};
+	char recordFilePath[128] = {0};
+	struct tm tmpTm;
+//	sdk_disk_t diskInfo[16];
+//	int len = 0;
+	char usbPath[64] = {0};
+
+	if(pBackup == NULL)
+	{
+		return -1;
+	}
+
+	if(getUsbMountPath(usbPath) <= 0)
+	{
+		printf("can not find usb mount path\r\n");
+		return -2;
+	}
+
+	memcpy(&file, &pBackup->record_file_info, sizeof(record_search_file_t));
+
+	/*  */
+	memset(diskPath, 0, sizeof(diskPath));
+	sprintf(diskPath, "%s/disk%04X", DISK_PATH, file.diskNo);
+	memset(recordFilePath, 0, sizeof(recordFilePath));
+	sprintf(recordFilePath, "%s/%04X", diskPath, file.recordNo);
+
+	if(playbackRecordOpen(&g_backup.fileInfo, recordFilePath, file.startAddr, file.endAddr, 0) != 0)
+	{
+		playbackRecordClose(&g_backup.fileInfo);
+		Printf("open record file error\r\n");
+		return -1;
+	}
+
+	sprintf(g_backup.aviFileName, "%s/record-%04X-%04X", usbPath, file.diskNo, file.recordNo);
+	if(localtime_r((const time_t *)&file.startTime, &tmpTm) != NULL)
+	{
+		sprintf(g_backup.aviFileName, "%s-%04d%02d%02d%02d%02d%02d", g_backup.aviFileName, tmpTm.tm_year + 1900, tmpTm.tm_mon + 1, tmpTm.tm_mday, tmpTm.tm_hour, tmpTm.tm_min, tmpTm.tm_sec);
+	}
+	if(localtime_r((const time_t *)&file.endTime, &tmpTm) != NULL)
+	{
+		sprintf(g_backup.aviFileName, "%s-%04d%02d%02d%02d%02d%02d", g_backup.aviFileName, tmpTm.tm_year + 1900, tmpTm.tm_mon + 1, tmpTm.tm_mday, tmpTm.tm_hour, tmpTm.tm_min, tmpTm.tm_sec);
+	}
+
+	sprintf(g_backup.aviFileName, "%s.avi", g_backup.aviFileName);
+	Printf("g_backup.aviFileName = (%s)\r\n", g_backup.aviFileName);
+
+	if(threadPoolAddWorker(NULL, backupRecordThread, NULL, 0) != 0)
+	{
+		Printf("backup record, thread pool add work error\r\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*  */
+int playbackGetProcess()
+{
+	return g_backup.process;
+}
+

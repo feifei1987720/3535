@@ -1,0 +1,210 @@
+/******************************************************************************
+  File Name 		: tsmux.h
+  Version		: Initial Draft
+  Created		: 2011/06/14
+  Last Modified 	:
+  Description		: Ts pack
+  Function List 	:
+  History			:
+
+******************************************************************************/
+#ifndef _TS_MUX_H_
+#define	_TS_MUX_H_
+
+
+//============================Transport Stream==========================================
+#define		TS_PACKET_LEN		188				//一个TS包的长度
+#define		SYNC_BYTE		0x47			//TS包的同步字节
+//#define		PCR_BASE	53955000//参考tsMuxeR软件定义的一个PCR基准
+#define		PCR_BASE		671531847
+#define		SYSTEM_CLOCK		27000000		//系统时钟频率27MHz
+#define		CLOCK			(SYSTEM_CLOCK/1000/300)//90KHz,27M的300分频
+#define		PCR_INTERVAL		2				//每隔几帧插入一个PCR包
+
+/* 每个RTP包中，最大的TS包个数 */
+#define		RTP_PACK_TS_MAX_NUM	7
+
+/*
+根据基础码流的frame_rate_code字段可以计算出视频帧的帧速率frame_rate,
+从而得到每一帧的帧历时
+frame_time = (1/frame_rate)*90000
+*/
+
+
+//============================PES definition============================================
+#define		HPES_HEADER_FIX_LEN		20				//H264 PES包头的长度
+#define		APES_HEADER_FIX_LEN		14				//AAC PES包头的长度
+
+#define		PES_STREAM_ID_VIDEO		0xE0			//PES包视频流ID
+#define		PES_STREAM_ID_AUDIO		0xC0			//PES包音频流ID
+#define  	FRAME_MAX_LEN			2*1024*1024		//一帧的最大长度
+//#define		PTS_BASE		54000000		//随便定义一个PTS的基准数
+#define		PTS_BASE			671576847
+
+
+typedef enum
+{
+	TS_PAT_E = 0,
+	TS_PMT_E,
+	TS_SIT_E,
+	TS_PCR_E,
+	TS_VIDEO_E,
+	TS_AUDIO_E,
+}TS_TYPE;
+
+//lsl add
+typedef enum
+{
+	A_FRAME = 0,
+	V_FRAME,
+}FrameType_E;
+
+#define FRAME_TYPE_AUDIO          0
+#define FRAME_TYPE_SLICE          1
+#define FRAME_TYPE_IDR            5
+#define FRAME_TYPE_SEI            6
+#define FRAME_TYPE_SPS            7
+#define FRAME_TYPE_PPS            8
+#define FRAME_TYPE_SEQ_END        9
+
+
+#define PES_PROGRAM_STREAM_MAP          0xbc
+#define PES_PRIVATE_STREAM_1            0xbd
+#define PES_PADDING                     0xbe
+#define PES_PRIVATE_STREAM_2            0xbf
+#define PES_ECM                         0xb0
+#define PES_EMM                         0xb1
+#define PES_PROGRAM_STREAM_DIRECTORY    0xff
+#define PES_DSMCC_STREAM                0xf2
+#define PES_ITU_T_H222_1_TYPE_E_STREAM  0xf8
+#define PES_EXTENDED_STREAM_ID          0xfd
+        
+#define STREAM_TYPE_VIDEO_MPEG1     0x01
+#define STREAM_TYPE_VIDEO_MPEG2     0x02
+#define STREAM_TYPE_AUDIO_MPEG1     0x03
+#define STREAM_TYPE_AUDIO_MPEG2     0x04
+#define STREAM_TYPE_PRIVATE_SECTION 0x05
+#define STREAM_TYPE_PRIVATE_DATA    0x06
+#define STREAM_TYPE_AUDIO_AAC       0x0f
+#define STREAM_TYPE_VIDEO_MPEG4     0x10
+#define STREAM_TYPE_VIDEO_H264      0x1b
+	    
+#define STREAM_TYPE_AUDIO_AC3       0x81
+#define STREAM_TYPE_AUDIO_DTS       0x8a
+
+
+#define PES_PAYLOAD_SIZE_MAX 65500
+
+
+typedef struct _PES_HEADER_
+{
+#if 0
+	unsigned char 	StartCode[3];		//
+	unsigned char	StreamID;			//
+	
+	//0-高8位,1-低8位,length=PesLength[0]*256+PesLength[1]
+	unsigned char	Length[2];		
+	
+	unsigned char	HeadFlag[2];	//
+	unsigned char	HeadLength;		//
+	unsigned char	Pts[5];			//对于音视频数据，最少PTS是需要的
+	unsigned char	Reserve[6];
+
+	unsigned char	*pESdata;	
+#else
+	unsigned char pesHeadBuf[50];//pes头
+	int pesHeadSize;//pes头的长度
+	unsigned char *pESdata;//es数据
+#endif
+}PES_Header;
+
+typedef struct Ts_Callback_Param_T
+{
+	int frameType;//音频 、视频
+	int frameFormat;//音视频编码格式
+	unsigned long long pts;
+
+	unsigned char *m_ptr;//传入的buf
+	unsigned char *m_pForTsPacked;//用于保存ts流  （可指向m_pBuf的某一段  因为前一部分添加用户信息，减少一次数据拷贝）
+	unsigned short curTsPackNum;//当前已经有的ts包数目
+	unsigned short maxTsPackNum;//一次最多需要的ts包数目  当curTsPackNum == maxTsPackNum时，触发一次回调
+}Ts_Callback_Param_T;
+
+typedef int (*callbackFunc_t)(Ts_Callback_Param_T param);
+typedef struct Ts_Callback_T
+{
+	Ts_Callback_Param_T param;
+
+	callbackFunc_t tsCallbackFunc;//回调函数
+}Ts_Callback_T;
+
+typedef struct Ts_Muxer_T
+{
+	unsigned char m_videoType;
+	unsigned char m_audioType;
+	unsigned char m_unused[2];
+
+//	unsigned char *m_pForTsPacked;	//Ts Buffer
+
+//	unsigned int m_tsPacketBuffSize;	//Ts Buffer Size 
+	unsigned int m_tsPacketsPos;		//Ts Buffer used size
+	unsigned int m_tsPacketsCnt;		//Available TS packets count
+	
+	unsigned char *m_pTsBuff;			//操作的TS缓冲区
+	unsigned int m_nCountPCR;		//PCR包的计数值
+
+	unsigned short	m_pidSIT;  /**/
+	unsigned short	m_pidPAT;
+	unsigned short	m_pidPCR;			//PCR包的PID
+	unsigned short	m_pidPMT;
+	unsigned short	m_pidVideo;			//视频流PID
+	unsigned short	m_pidAudio;			//音频流PID
+
+	int m_nFrameDuration;	//一帧的历时长度
+	PES_Header m_PESInfo;
+
+	short m_aptsInit;
+	short m_hptsInit;
+	
+	short m_pcrInit;
+	unsigned long long  m_hpts0;
+	unsigned long long  m_pcr0;
+	unsigned long long  m_apts0;
+	
+	//unsigned long long  mpts;
+	 unsigned int m_num;
+	
+	struct timeval 	m_pcrt;
+	struct timeval 	m_hptst;
+	struct timeval 	m_aptst;
+
+	char hm_continuity_counter;
+	char am_continuity_counter;
+	char m_PAT_continuity_counter;
+   	char m_PMT_continuity_counter;
+   	char m_SIT_continuity_counter;
+
+	Ts_Callback_T tsCallback;
+}Ts_Muxer_T;
+
+
+
+void TsMuxerInit(Ts_Muxer_T *pTsMutex);
+void TsMuxerUninit(Ts_Muxer_T *pTsMutex);
+
+void Reset(Ts_Muxer_T *pTsMutex);
+
+void setStreamType(Ts_Muxer_T *pTsMutex, int videoType, int audioType);
+void initTsCallBack(Ts_Muxer_T *pTsMutex, void *ptr, unsigned char *pTsBuf, int maxTsPackNum, callbackFunc_t tsCallbackFunc);
+void updateTsCallBackParam(Ts_Muxer_T *pTsMutex, Ts_Callback_Param_T *param);
+int SetPID(Ts_Muxer_T *pTsMutex, TS_TYPE StreamType, unsigned short pid);
+int WriteTs(Ts_Muxer_T *pTsMutex, unsigned char *pFrame, int len, FrameType_E frametype,struct timeval *pts );
+int Initilize(Ts_Muxer_T *pTsMutex, float framerate, unsigned short pidPCR, unsigned short pidPMT, unsigned short pidAudio, unsigned short pidVedio);
+void DeInitilize(Ts_Muxer_T *pTsMutex);
+unsigned char * GetBuffForTsPacked(Ts_Muxer_T *pTsMutex);
+int GetTsPacketsLen(Ts_Muxer_T *pTsMutex);
+int GetTsPacketsCnt(Ts_Muxer_T *pTsMutex);
+//	struct timeval  tf;
+
+#endif	//_TS_MUX_H_
+

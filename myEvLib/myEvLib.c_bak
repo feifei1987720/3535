@@ -1,0 +1,556 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <assert.h>
+#include <ev.h>
+
+#include "networkLib.h"
+#include "myThreadLib.h"
+
+#define MAXLEN 1023
+#define PORT 9999
+#define ADDR_IP "192.168.16.71"
+
+
+
+#define MAX_BUFFER_LEN		(1024*1024)
+#define MAX_PACKET_BUFFER_LEN	(1400)
+#define MAX_FD_SIZE		(1024)
+
+typedef struct ev_recv_info_t
+{
+	ev_io recvWatcher;//接收监听
+	unsigned int recvNum;//接收socket的次数，用于判断超时
+
+	network_dev_channel_info_t *pDevChannelInfo;
+
+	char *pPacketBuf;//包缓冲
+	int packetLen;//接收的包数据的长度
+	char *pFrameBuf;//接收缓冲区
+	int frameLen;//已经接收的数据长度
+
+	int videoFrameNo;//视频帧序号
+}ev_recv_info_t;
+
+ev_recv_info_t g_recv_info[MAX_FD_SIZE];
+
+int socket_init();
+void accept_callback(struct ev_loop *loop, ev_io *w, int revents);
+void recv_callback(struct ev_loop *loop, ev_io *w, int revents);
+void write_callback(struct ev_loop *loop, ev_io *w, int revents);
+
+
+/* An item in the connection queue. */
+typedef struct msg_queue_t_item CQ_ITEM;
+struct msg_queue_t_item
+{
+	int sfd;
+	char szAddr[16];
+	int port;
+	CQ_ITEM *next;
+};
+
+
+/* A connection queue. */
+typedef struct msg_queue_t CQ;
+struct msg_queue_t
+{
+	CQ_ITEM *head;
+	CQ_ITEM *tail;
+	pthread_mutex_t lock;
+};
+
+
+/*
+ * Initializes a connection queue.
+ */
+static void cq_init(CQ *cq)
+{
+	pthread_mutex_init(&cq->lock, NULL);
+	cq->head = NULL;
+	cq->tail = NULL;
+}
+
+
+/*
+ * Looks for an item on a connection queue, but doesn't block if there isn't
+ * one.
+ * Returns the item, or NULL if no item is available
+ */
+static CQ_ITEM *cq_pop(CQ *cq)
+{
+	CQ_ITEM *item;
+
+
+	pthread_mutex_lock(&cq->lock);
+	item = cq->head;
+	if (NULL != item)
+	{
+		cq->head = item->next;
+		if (NULL == cq->head)
+		{
+			cq->tail = NULL;
+		}
+	}
+	pthread_mutex_unlock(&cq->lock);
+
+	return item;
+}
+
+
+/*
+ * Adds an item to a connection queue.
+ */
+static void cq_push(CQ *cq, CQ_ITEM *item)
+{
+	item->next = NULL;
+
+	pthread_mutex_lock(&cq->lock);
+	if(NULL == cq->tail)
+	{
+		cq->head = item;
+	}
+	else
+	{
+		cq->tail->next = item;
+	}
+	cq->tail = item;
+	pthread_mutex_unlock(&cq->lock);
+}
+
+
+typedef struct
+{
+	pthread_t thread_id;         /* unique ID of this thread */
+	struct ev_loop *loop;     /* libev loop this thread uses */
+	struct ev_async async_watcher;   /* async watcher for new connect */
+	struct msg_queue_t *pMsgQueue; /* queue of new connections to handle */
+}work_event_t;
+
+
+typedef struct
+{
+	pthread_t thread_id;         /* unique ID of this thread */
+	struct ev_loop *loop;     /* libev loop this thread uses */
+	struct ev_io accept_watcher;   /* accept watcher for new connect */
+}DISPATCHER_THREAD;
+
+
+/*
+ * Each libev instance has a async_watcher, which other threads
+ * can use to signal that they've put a new connection on its queue.
+ */
+static work_event_t *gp_work_event;
+/*
+ * Number of worker threads that have finished setting themselves up.
+ */
+static int g_threadNum = 0;
+static pthread_mutex_t init_lock;
+static pthread_cond_t init_cond;
+
+
+/* 工作线程 */
+static void *event_work_thread(void *arg)
+{
+	work_event_t *me = arg;
+
+	setPthreadPriority(PTHREAD_SCHEDULED_PRIORITY_HIGH);
+
+	pthread_mutex_lock(&init_lock);
+	g_threadNum++;
+	pthread_cond_signal(&init_cond);
+	pthread_mutex_unlock(&init_lock);
+
+
+	me->thread_id = pthread_self();
+	ev_loop(me->loop, 0);
+
+	return NULL;
+}
+
+
+/* 创建工作线程 */
+static void create_worker_thread(void *(*func)(void *), void *arg)
+{
+	pthread_t       thread;
+	pthread_attr_t  attr;
+	int             ret;
+
+
+	pthread_attr_init(&attr);
+
+	if((ret = pthread_create(&thread, &attr, func, arg)) != 0)
+	{
+		fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
+		exit(1);
+	}
+}
+
+/* 接收数据 */
+void recv_callback(struct ev_loop *loop, ev_io *w, int revents)
+{
+	int ret =0;
+	int len = 0;
+	int channel = 0;
+	int offset = 0;
+	int dataLen = 0;
+	unsigned int pts = 0;
+	stream_frame_t *pVideoFrame = NULL;
+	stream_frame_queue_t *pVideoFrameQueue = NULL;
+
+	int count = 0;
+
+#if 0
+	stream_packet_t * pPacket = NULL;
+	stream_packet_queue_t *pPacketQueue = g_recv_info[w->fd].pDevChannelInfo->pPacketQueue;
+
+
+	if(g_recv_info[w->fd].packetLen == 0)
+	{
+		pPacket = streamGetPacketWriteBuffer(pPacketQueue);
+		if(pPacket != NULL)
+		{
+			return;
+		}
+	}
+#endif
+	while(0)
+	{
+		ret = recv(w->fd, g_recv_info[w->fd].pPacketBuf + g_recv_info[w->fd].packetLen, 4 - g_recv_info[w->fd].packetLen, 0);
+		if(ret == 0)
+		{
+			printf("1aaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+			break;
+		}
+		else
+		{
+			if((errno == EAGAIN) || (errno == EWOULDBLOCK))
+			{
+			}
+			else
+			{
+				printf("recv error, ret :%d , close socket fd : %d\n", ret, w->fd);
+				myEvDelSocketEvent(w->fd);
+			printf("2aaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+				break;
+			}
+		}
+	}
+
+	while(1)
+	{
+		if(g_recv_info[w->fd].packetLen < 4)
+		{
+//		printf("1aaaaaaaaaaaaaa ========== %d\r\n", g_recv_info[w->fd].packetLen);
+			ret = recv(w->fd, g_recv_info[w->fd].pPacketBuf + g_recv_info[w->fd].packetLen, 4 - g_recv_info[w->fd].packetLen, 0);
+			if(ret > 0)
+			{
+				g_recv_info[w->fd].packetLen += ret;
+				if(ret < 4)
+				{
+					printf("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n");
+				}
+			}
+			else if(ret == 0)
+			{
+				break;
+			}
+			else
+			{
+				if((errno == EAGAIN) || (errno == EWOULDBLOCK))
+				{
+				}
+				else
+				{
+					printf("recv error, ret :%d , close socket fd : %d\n", ret, w->fd);
+					myEvDelSocketEvent(w->fd);
+					break;
+				}
+			}
+		}
+		else
+		{
+//		printf("2aaaaaaaaaaaaaa ========== %d\r\n", g_recv_info[w->fd].packetLen);
+			if(g_recv_info[w->fd].packetLen == 4)
+			{
+				if(g_recv_info[w->fd].pPacketBuf[0] != '$')
+				{
+					//				memcpy(packet, &Magic, 1);
+					ret = recv(w->fd, g_recv_info[w->fd].pPacketBuf + 1, MAX_PACKET_BUFFER_LEN - 1 , 0);
+					g_recv_info[w->fd].packetLen = 0;
+					if(ret > 0)
+					{
+						break;
+					}
+					else if(ret == 0)
+					{
+						break;
+					}
+					else
+					{
+						if((errno == EAGAIN) || (errno == EWOULDBLOCK))
+						{
+						}
+						else
+						{
+							printf("recv error, ret :%d , close socket fd : %d\n", ret, w->fd);
+							myEvDelSocketEvent(w->fd);
+							break;
+						}
+					}
+				}
+
+				channel = g_recv_info[w->fd].pPacketBuf[1];
+				if(channel < 0x00 || channel > 0x03)
+				{
+					g_recv_info[w->fd].packetLen = 0;
+					break;
+				}
+
+				len = (g_recv_info[w->fd].pPacketBuf[2] << 8) + g_recv_info[w->fd].pPacketBuf[3];
+				if((len <= 0) || (len > MAX_PACKET_BUFFER_LEN - 4))
+				{
+					g_recv_info[w->fd].packetLen = 0;
+					break;
+				}
+			}
+			ret = recv(w->fd, g_recv_info[w->fd].pPacketBuf + g_recv_info[w->fd].packetLen, len - g_recv_info[w->fd].packetLen + 4, 0);
+//			printf("ret ==================== %d\r\n", ret);
+			if(ret > 0)
+			{
+#if 1
+				g_recv_info[w->fd].packetLen += ret;
+//		printf("3aaaaaaaaaaaaaa ========== %d\r\n", g_recv_info[w->fd].packetLen);
+				if(g_recv_info[w->fd].packetLen == len + 4)
+				{//收到完整的一包
+					ret = RTSP_GetStreamFrameInfo(NULL, g_recv_info[w->fd].pPacketBuf + 4, g_recv_info[w->fd].packetLen - 4, &offset, &dataLen, &pts);
+					//					printf("sock %d, recv packet over, len = %d, offset = %d, dataLen = %d\r\n", w->fd, g_recv_info[w->fd].packetLen, offset, dataLen);
+					if(g_recv_info[w->fd].frameLen + g_recv_info[w->fd].packetLen - 4 - offset < MAX_BUFFER_LEN)
+					{
+						memcpy(g_recv_info[w->fd].pFrameBuf + g_recv_info[w->fd].frameLen, g_recv_info[w->fd].pPacketBuf + 4 + offset, g_recv_info[w->fd].packetLen - 4 - offset);
+						g_recv_info[w->fd].frameLen += g_recv_info[w->fd].packetLen - 4 - offset;
+						if(channel == 2)
+						{
+						}
+						else
+						{
+							if(ret == 3)
+							{
+#if 0
+								pVideoFrameQueue = g_recv_info[w->fd].pDevChannelInfo->pVideoFrameQueue;
+								streamFrameQueueLock(pVideoFrameQueue);
+								pVideoFrame = streamGetFrameQueueBuffer(pVideoFrameQueue, g_recv_info[w->fd].frameLen + 4);
+								if(pVideoFrame != NULL)
+								{
+									pVideoFrame->frameHead.type = FRAME_TYPE_VIDEO;
+									pVideoFrame->frameHead.frameNo = ((g_recv_info[w->fd].videoFrameNo)++)&0xFFFF;
+									pVideoFrame->frameHead.source = FRAME_SOURCE_IPC;
+									pVideoFrame->frameHead.info.video.format = FRAME_VIDEO_TYPE_H264;
+									pVideoFrame->frameHead.info.video.frameRate = 30;
+									pVideoFrame->frameHead.info.video.bitRate = 500;
+									pVideoFrame->frameHead.len = g_recv_info[w->fd].frameLen + 4;
+									pVideoFrame->frameHead.pts = pts;
+									pVideoFrame->pFrameBuf[0] = 0x00;
+									pVideoFrame->pFrameBuf[1] = 0x00;
+									pVideoFrame->pFrameBuf[2] = 0x00;
+									pVideoFrame->pFrameBuf[3] = 0x01;
+
+									memcpy(&pVideoFrame->pFrameBuf[4], g_recv_info[w->fd].pFrameBuf, g_recv_info[w->fd].frameLen);
+									streamInsertFrameToFrameQueue(pVideoFrameQueue, pVideoFrame);
+								}
+								steramFrameQueueUnlock(pVideoFrameQueue);
+#endif
+								g_recv_info[w->fd].frameLen = 0;
+							}
+						}
+					}
+					g_recv_info[w->fd].packetLen = 0;
+					break;
+				}
+#endif
+			}
+			else if(ret == 0)
+			{
+				break;
+			}
+			else
+			{
+				if((errno == EAGAIN) || (errno == EWOULDBLOCK))
+				{
+				}
+				else
+				{
+					printf("recv error, ret :%d , close socket fd : %d\n", ret, w->fd);
+					myEvDelSocketEvent(w->fd);
+					break;
+				}
+			}
+		}
+	}
+
+//	printf("recv data len %d\r\n", g_recv_info[w->fd].packetLen);
+}
+
+/* 监听异步通知 */
+static void async_callback(EV_P_ ev_async *w, int revents)
+{
+	CQ_ITEM *item;
+
+	item = cq_pop(((work_event_t*)(w->data))->pMsgQueue);
+
+	if(NULL != item)
+	{
+		ev_io_init(&g_recv_info[item->sfd].recvWatcher, recv_callback, item->sfd, EV_READ);
+		ev_io_start(((work_event_t*)(w->data))->loop, &g_recv_info[item->sfd].recvWatcher);
+
+		//cqi_free(item);
+		free(item);
+		item = NULL;
+	}
+}
+
+/* 工作线程事件初始化 */
+static void work_event_init(work_event_t *me)
+{
+	me->loop = ev_loop_new(0);
+	if(! me->loop)
+	{
+		fprintf(stderr, "Can't allocate event base\n");
+		exit(1);
+	}
+
+	me->async_watcher.data = me;
+	/* Listen for notifications from other threads */
+	ev_async_init((struct ev_async *)&me->async_watcher, async_callback);
+	ev_async_start(me->loop, &me->async_watcher);
+
+	me->pMsgQueue = malloc(sizeof(struct msg_queue_t));
+	if (me->pMsgQueue == NULL)
+	{
+		perror("Failed to allocate memory for connection queue\n");
+		exit(EXIT_FAILURE);
+	}
+
+	cq_init(me->pMsgQueue);
+}
+
+/* 添加一个事件 */
+void myEvAddSocketEvent(int sock, network_dev_channel_info_t *pDevChannelInfo)
+{ 
+	static int i = 0;
+	int robin = i%g_threadNum;
+
+	CQ_ITEM *pNewItem = malloc(sizeof(CQ_ITEM));
+	assert(pNewItem);
+
+	pNewItem->sfd = sock;
+
+	if(g_recv_info[sock].pFrameBuf == NULL)
+	{
+		g_recv_info[sock].pFrameBuf = (char *)malloc(MAX_BUFFER_LEN);
+		assert(g_recv_info[sock].pFrameBuf);
+	}
+	g_recv_info[sock].frameLen = 0;
+
+	if(g_recv_info[sock].pPacketBuf == NULL)
+	{
+		g_recv_info[sock].pPacketBuf = (char *)malloc(MAX_PACKET_BUFFER_LEN);
+		assert(g_recv_info[sock].pPacketBuf);
+	}
+	g_recv_info[sock].packetLen = 0;
+
+	g_recv_info[sock].pDevChannelInfo = pDevChannelInfo;
+
+	cq_push(gp_work_event[robin].pMsgQueue, pNewItem);
+	ev_async_send(gp_work_event[robin].loop, &(gp_work_event[robin].async_watcher));
+	i++;
+}
+
+/* 删除一个事件 */
+void myEvDelSocketEvent(int sock)
+{
+	int i = 0;
+
+	close(sock);
+
+	for(i = 0; i < g_threadNum; i++)
+	{
+		ev_io_stop(gp_work_event[i].loop, &g_recv_info[sock].recvWatcher);
+	}
+
+	if(g_recv_info[sock].pFrameBuf != NULL)
+	{
+		free(g_recv_info[sock].pFrameBuf);
+		g_recv_info[sock].pFrameBuf = NULL;
+	}
+	g_recv_info[sock].frameLen = 0;
+
+	if(g_recv_info[sock].pPacketBuf != NULL)
+	{
+		free(g_recv_info[sock].pPacketBuf);
+		g_recv_info[sock].pPacketBuf = NULL;
+	}
+	g_recv_info[sock].packetLen = 0;
+}
+
+/* 事件库初始化 */
+void myEvLibInit()
+{
+	int threadNum = 2;
+	int i = 0;
+
+	memset(g_recv_info, 0, sizeof(g_recv_info));
+
+	pthread_mutex_init(&init_lock, NULL);
+	pthread_cond_init(&init_cond, NULL);
+
+	gp_work_event = calloc(threadNum, sizeof(work_event_t));
+	if(!gp_work_event)
+	{
+		perror("Can't allocate thread descriptors\n");
+		exit(1);
+	}
+
+	for(i = 0; i < threadNum; i++)
+	{
+		work_event_init(&gp_work_event[i]);
+	}
+
+	/* Create threads after we've done all the libevent setup. */
+	for(i = 0; i < threadNum; i++)
+	{
+		create_worker_thread(event_work_thread, &gp_work_event[i]);
+	}
+
+	/* Wait for all the threads to set themselves up before returning. */
+	pthread_mutex_lock(&init_lock);
+	while(g_threadNum < threadNum)
+	{
+		pthread_cond_wait(&init_cond, &init_lock);
+	}
+	pthread_mutex_unlock(&init_lock);
+
+}
+
+void myEvLibDestroy()
+{
+	int i = 0;
+
+	for(i = 0; i < MAX_FD_SIZE; i++)
+	{
+		myEvDelSocketEvent(i);
+	}
+
+	pthread_mutex_destroy(&init_lock);
+	pthread_cond_destroy(&init_cond);
+}
+
+
+
+

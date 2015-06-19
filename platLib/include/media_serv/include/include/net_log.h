@@ -1,0 +1,232 @@
+/*
+ * 	Copyright (C) 2012-2099, Zhuhai RaySharp Technology Co., Ltd.
+ * 	
+ * 	File name: net_log.cpp
+ *	Author: abiao
+ *	Date:12/22/2012 
+ *	Description: 
+ *	History: draft
+ */
+
+#ifndef __NET_LOG_H__
+#define __NET_LOG_H__
+
+typedef enum _NET_LOG_TYPE_E_
+{
+	NET_LT_SYSTEM = 0,
+	NET_LT_CONFIG,
+	NET_LT_ALARM,
+	NET_LT_ACCOUNT,
+	NET_LT_RECORD,
+	NET_LT_STORAGE,
+	NET_LT_PTZ,
+	NET_LT_ALL
+}NET_LOG_TYPE_E;
+
+typedef enum _NET_SYSTEM_LOG_TYPE_E_
+{
+	NET_SLT_STARTUP,
+	NET_SLT_SHUTDOWN,
+	NET_SLT_REBOOT,
+	NET_SLT_AUTOMAINTAIN,
+	NET_SLT_UPGRADE
+}NET_SYSTEM_LOG_TYPE_E;
+
+typedef enum _NET_PTZ_LOG_TYPE_E_
+{
+	NET_PLT_MOVE,
+	NET_PLT_ZOOM,
+	NET_PLT_FOCUS,
+	NET_PLT_IRISOPEN,
+	NET_PLT_IRISCLOSE,
+	NET_PLT_AUTOSCAN,
+	NET_PLT_CRUISE,
+	NET_PLT_SETPRESET,
+	NET_PLT_CLRPRESET,
+	NET_PLT_CALLPRESET,
+}NET_PTZ_LOG_TYPE_E;
+
+typedef enum _NET_CONFIG_LOG_TYPE_E_
+{
+	/**/
+	NET_CLT_SYSSET,		//
+	NET_CLT_RECSET,		//
+	NET_CLT_OSDSET,		//OSD 
+	NET_CLT_USERSET,
+	NET_CLT_ALARMSET,
+	NET_CLT_RECMODE,
+	NET_CLT_CLRSET,		/*color*/
+	NET_CLT_MDSET,
+	NET_CLT_COVERSET,
+	NET_CLT_PTZSET,
+	NET_CLT_NETSET,
+	NET_CLT_DDNSSET,
+	NET_CLT_TIMESET,
+	NET_CLT_RTSPSET,
+	NET_CLT_LANGTAOSET,
+	NET_CLT_MOBILESET,
+	NET_CLT_WCDMA,
+	NET_CLT_WIFISET,
+	NET_CLT_EMAILSET,
+	NET_CLT_STATE,
+	NET_CLT_NTPSET,
+	NET_CLT_CAMERASET,
+	NET_CLT_MOBILESTREAMSET,
+	NET_CLT_SUBSTREAMSET,
+	NET_CLT_MAINSTREAMSET,
+	NET_CLT_IPFILTER,
+	NET_CLT_FTPSET,
+	NET_CLT_PLATFORMPARA,
+	NET_CLT_SCHEDULE,
+	NET_CLT_PPPOE,
+	NET_CLT_DISKSET,
+	NET_CLT_SERIAL,
+	NET_CLT_GENERAL,
+	NET_CLT_DSTSET,
+	NET_CLT_MAINTAIN,
+	NET_CLT_ABNORMAL,
+	NET_CLT_DEFALUTEALL,
+	NET_CLT_INTELLIGENT,
+	NET_CLT_INTAVD,
+	NET_CLT_EMAILSCHEDULE,
+	NET_CLT_IPC,
+	NET_CLT_IPCIOALARM,
+	NET_CLT_ROUTERLAN,
+	NET_CLT_ROUTERWAN,
+	NET_CLT_IPCWIFI,
+	NET_CLT_VEHICLEMNG,
+	NET_CLT_OUTPUT,
+	NET_CLT_TELALARM_AREA,
+	NET_CLT_ALARM_WIRE_SENSOR,
+	NET_CLT_TELALARM_WIRELESS_SENSOR,
+	NET_CLT_PHONE_NUMBER_SET,
+	NET_CLT_HUAWEI_PLATFORM,
+	NET_CLT_ELECLOCK,
+	NET_CLT_CLOUDSTORAGE,
+	NET_CLT_CLOUDEMAIL,
+	NET_CLT_P2PMOBILE,
+	NET_CLT_DEVALLSTATUSSET,
+	NET_CLT_MAX_NUM
+	/* ......*/
+}NET_CONFIG_LOG_TYPE_E;
+
+typedef enum _NET_ALARM_LOG_TYPE_E_
+{
+	NET_ALT_MOTION,
+	NET_ALT_IO,
+	NET_ALT_VIDOE_LOSS
+}NET_ALARM_LOG_TYPE_E;
+
+typedef enum _NET_ACCOUNT_LOG_TYPE_E_
+{
+	NET_ATLT_LOGIN,
+	NET_ATLT_LOGOUT,
+	NET_ATLT_ADD,
+	NET_ATLT_DEL,
+	NET_ATLT_MODIFY
+}NET_ACCOUNT_LOG_TYPE_E;
+
+typedef enum _NET_RECORD_LOG_TYPE_E_
+{
+	NET_RLT_START_SCHEDULE,
+	NET_RLT_START_MANUAL,
+	NET_RLT_STOP,
+	NET_RLT_SEARCH,
+	NET_RLT_PLAYBACK,
+	NET_RLT_BACKUP,
+	NET_RLT_DOWNLOAD,_
+}NET_RECORD_LOG_TYEP_E;
+
+typedef enum _NET_STORAGE_LOG_TYPE_E_
+{
+	NET_STLT_FORMAT,
+	NET_STLT_HDD_NOSPACE,
+	NET_STLT_HDD_ERR,
+	NET_STLT_AUTO_COVER,/**/
+	NET_STLT_CHANGE_PARTITION
+}NET_STORAGE_LOG_TYPE_E;
+
+
+#define MAX_NAME_LEN 16
+
+typedef struct _NET_SYSTEM_LOG_S_
+{
+	NET_SYSTEM_LOG_TYPE_E SystemType;
+	int  userkey;
+	int  optResult; /*success:0,fail:-1*/
+	char ip[MAX_NAME_LEN];/**/
+}NET_SYSTEM_LOG_S;
+
+typedef struct _NET_CONFIG_LOG_S_
+{
+	NET_CONFIG_LOG_TYPE_E ConfigType;
+	int userkey;
+	int confResult; /*success:0,fail:-1*/
+	char ip[MAX_NAME_LEN];/**/
+}NET_CONFIG_LOG_S;
+
+typedef struct _NET_ALARM_LOG_S_
+{
+	NET_ALARM_LOG_TYPE_E AlarmType;
+	int chn;
+	int record;/**/
+}NET_ALARM_LOG_S;
+
+typedef struct _NET_ACCOUNT_LOG_S_
+{
+	NET_ACCOUNT_LOG_TYPE_E AccountType;
+	int  userkey;
+	int  optResult; /*success:0,fail:-1*/
+	char ip[MAX_NAME_LEN];/**/
+}NET_ACCOUNT_LOG_S;
+
+typedef struct _NET_RECORD_LOG_S_
+{
+	NET_RECORD_LOG_TYEP_E RecordType;
+	int  userkey;
+	int  optResult; /*success:0,fail:-1*/
+	char ip[MAX_NAME_LEN];/**/
+}NET_RECORD_LOG_S;
+
+typedef struct _NET_STORAGE_LOG_S_
+{
+	NET_STORAGE_LOG_TYPE_E StorageType;
+	int userkey;
+	int optResult; /*success:0,fail:-1*/
+	char ip[MAX_NAME_LEN];/**/
+}NET_STORAGE_LOG_S;
+
+typedef struct _NET_PTZ_LOG_S_
+{
+	NET_PTZ_LOG_TYPE_E PTZType;
+	int userkey;
+	int optResult; /*success:0,fail:-1*/
+	char ip[MAX_NAME_LEN];/**/
+}NET_PTZ_LOG_S;
+
+typedef struct _NET_LOG_INFO_
+{
+	NET_LOG_TYPE_E type;
+	union
+	{
+		NET_SYSTEM_LOG_S system;
+		NET_CONFIG_LOG_S config;
+		NET_ALARM_LOG_S alarm;
+		NET_ACCOUNT_LOG_S account;
+		NET_RECORD_LOG_S record;
+		NET_STORAGE_LOG_S storage;
+		NET_PTZ_LOG_S ptz;
+	}info;
+}NET_LOG_INFO_S;
+
+typedef void RSLOGH;
+typedef int (*NetWriteLogCallBack)( NET_LOG_INFO_S *plog, RSLOGH *para );
+
+typedef struct _NET_LOG_
+{
+	RSLOGH *para;
+	NetWriteLogCallBack writelogcb;
+}NET_LOG_S;
+
+#endif/*__NET_LOG_H__*/
+

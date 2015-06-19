@@ -1,0 +1,13 @@
+#ifndef __SEM_UTIL_H__
+#define __SEM_UTIL_H__
+
+typedef void* SemHandl_t;
+
+SemHandl_t MakeSem(); ///< Initialize the semaphore.
+int SemRelease(SemHandl_t hndlSem); ///< Unlock the semaphore.
+int SemWait(SemHandl_t hndlSem); ///< Lock the semaphore.
+int DestroySem(SemHandl_t hndlSem); ///< Destory the semaphore.
+
+
+#endif//__SEM_UTIL_H__
+

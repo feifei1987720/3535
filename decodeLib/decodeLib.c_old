@@ -1,0 +1,1653 @@
+/***********************************************************************************
+* Filename:	decodeLib.c
+*
+************************************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <assert.h>
+#include <sys/reboot.h>
+
+#include "hiLib.h"
+#include "decodeLib.h"
+#include "networkLib.h"
+#include "streamLib.h"
+#include "commonLib.h"
+#include "rtspCLib.h"
+#include "queueLib.h"
+#include "myThreadLib.h"
+#include "playbackLib.h"
+#include "global.h"
+#include "configLib.h"
+#include "appLib.h"
+#include "mylist.h"
+#include "mylist.c"
+
+#define USED_THREAD_POOL		0//
+
+#define MAX_DISPLAY_EX_NUM		1//   扩展数目   如：全屏
+#ifdef HI3535
+#define MAX_DECODE_THREAD_NUM		24//最大解码线程
+#else
+#define MAX_DECODE_THREAD_NUM		8//最大解码线程
+#endif
+
+
+typedef struct decode_thread_info_t
+{//解码线程信息
+	pthread_mutex_t msgMutex;//解码线程消息队列锁
+	LINK_QUEUE_T msgQueue;//解码线程消息队列
+}decode_thread_info_t;
+
+
+typedef struct decode_thread_channel_info_t
+{////解码通道的信息
+	unsigned char runStatus;//运行状态
+	unsigned char channelNo;//设备号
+	unsigned char streamNo;//通道号
+	unsigned char viewPos;//显示位置
+
+	int waitIFrame;
+	int frameNo;
+	int readBegin;
+	int readEnd;
+
+	struct kernel_list_head list;
+}decode_thread_channel_info_t;
+
+typedef struct decode_msg_t
+{//解码通道的消息
+	unsigned char channelNo;//设备号
+	unsigned char streamNo;//通道号
+	unsigned char viewPos;//显示位置
+}decode_msg_t;
+
+typedef enum decode_msg_queue_e
+{//解码消息队列类型
+	DECODE_MSG_QUEUE_TYPE_ADD = 0,	//添加
+	DECODE_MSG_QUEUE_TYPE_DEL,	//删除
+	DECODE_MSG_QUEUE_TYPE_DEL_ALL,	//
+	DECODE_MSG_QUEUE_TYPE_PAUSE,	//暂停
+	DECODE_MSG_QUEUE_TYPE_PAUSE_ALL,//暂停所有
+	DECODE_MSG_QUEUE_TYPE_RUN,	//运行
+	DECODE_MSG_QUEUE_TYPE_RUN_ALL,	//
+}decode_msg_queue_e;
+
+
+
+typedef struct decode_dev_channel_info_t
+{//解码信息
+	unsigned char isUsed;//是否在使用
+	pthread_mutex_t mutex;
+	pthread_t threadId;//Id
+	int runFlag;//解码线程运行标志
+
+	unsigned char channelNo;//设备号
+	unsigned char streamNo;//通道号
+	unsigned char viewPos;//显示位置
+}decode_dev_channel_info_t;
+
+
+static int g_viewDisplayNum = 0;//分屏数目
+static int g_resolution = 0;//vo分辨率
+static int g_offsetView = 0;//编译窗口
+static unsigned char g_fullscreen = 0;//是否全屏
+static unsigned char g_audioEnable = 0;//使能音频
+static decode_dev_channel_info_t g_devChannel[MAX_DISPLAY_NUM + MAX_DISPLAY_EX_NUM];
+static decode_thread_info_t decodeThreadInfo[MAX_DECODE_THREAD_NUM];
+static unsigned char g_decodeHaveNoDataFlag[MAX_DISPLAY_NUM] = {0};
+static pthread_t g_decodeThreadId[MAX_DECODE_THREAD_NUM];
+static pthread_t g_userThreadId;
+static pthread_t g_decodeThread;
+
+
+//ssf
+//int gs_AppDisplayNum = 0;
+
+char UserPicName[] = "/app/bin/pic_704_396_p420_novideo01.yuv";
+VIDEO_FRAME_INFO_S stFrame;
+
+/* 解码线程 */
+#ifdef USED_THREAD_POOL
+static void * decodeThread(char *arg, int argLen)
+#else
+void *decodeThread(void *arg)
+#endif
+{
+	int ret = 0;
+	int queueNum = 0;
+	unsigned char channelNo = 0;
+	unsigned char streamNo = 0;
+	unsigned char frameRate[MAX_DECODE_THREAD_NUM] = {0};
+	stream_frame_t * pFrame = NULL;
+	stream_frame_queue_t *pFrameQueue = NULL;
+	decode_msg_t msg = {0};
+	HI_S32 s32Ret;
+	SIZE_S stSize;
+	int framerate = 30;
+	char streamBuffer[256] = {0};
+	VDEC_CHN_ATTR_S stVdecAttr = {0};
+	int u32Width;
+	int u32Height;
+
+	setPthreadPriority(PTHREAD_SCHEDULED_PRIORITY_HIGH_EST);
+
+	link_queue_data_t decodeMsg = {0};
+	decode_thread_channel_info_t pDecodeChannel;
+
+	#if USED_THREAD_POOL
+	int no = 0;
+	if(argLen != sizeof(no))
+	{
+		Printf("thread arg len is error, %d\r\n", argLen);
+	}
+	memcpy(&no, arg, sizeof(no));
+	#else
+	int no = (int)(int *)(arg) ;
+	#endif
+
+	while(1)
+	{
+		memset(&decodeMsg, 0, sizeof(link_queue_data_t));
+		/* 监测管理线程消息队列 */
+		pthread_mutex_lock(&decodeThreadInfo[no].msgMutex);
+		ret = queueLinkOut(&decodeThreadInfo[no].msgQueue, &decodeMsg);
+		queueNum = queueLinkLength(decodeThreadInfo[no].msgQueue);
+		pthread_mutex_unlock(&decodeThreadInfo[no].msgMutex);
+
+		if(ret == 0)
+		{//接收到消息
+			switch(decodeMsg.type)
+			{
+				case DECODE_MSG_QUEUE_TYPE_ADD:
+				{//增加
+					memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+					pDecodeChannel.runStatus = FLAG_RUN;
+					pDecodeChannel.channelNo = msg.channelNo;
+					pDecodeChannel.streamNo = msg.streamNo;
+					pDecodeChannel.viewPos = msg.viewPos;
+					pDecodeChannel.waitIFrame = 0;
+					pDecodeChannel.frameNo = 0;
+					pDecodeChannel.readBegin = -2;
+					pDecodeChannel.readEnd = -2;
+					
+					break;
+				}
+				case DECODE_MSG_QUEUE_TYPE_DEL:
+				{//删除
+					memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+					pDecodeChannel.runStatus = FLAG_EXIT;
+					pDecodeChannel.channelNo = msg.channelNo;
+					pDecodeChannel.streamNo = msg.streamNo;
+					pDecodeChannel.viewPos = msg.viewPos;
+					AppDestroyVideo(pDecodeChannel.channelNo);
+					break;
+				}
+				case DECODE_MSG_QUEUE_TYPE_DEL_ALL:
+				{//删除
+					memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+					pDecodeChannel.runStatus = FLAG_EXIT;
+					AppDestroyVideo(pDecodeChannel.channelNo);
+					break;
+				}
+				case DECODE_MSG_QUEUE_TYPE_PAUSE:
+				{//
+					memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+					pDecodeChannel.runStatus = FLAG_PAUSE;
+					pDecodeChannel.channelNo = msg.channelNo;
+					pDecodeChannel.streamNo = msg.streamNo;
+					pDecodeChannel.viewPos = msg.viewPos;
+					break;
+				}
+				case DECODE_MSG_QUEUE_TYPE_PAUSE_ALL:
+				{//
+					memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+					pDecodeChannel.runStatus = FLAG_PAUSE;
+					break;
+				}
+				case DECODE_MSG_QUEUE_TYPE_RUN:
+				{//
+					memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+					pDecodeChannel.runStatus = FLAG_RUN;
+					pDecodeChannel.channelNo = msg.channelNo;
+					pDecodeChannel.streamNo = msg.streamNo;
+					pDecodeChannel.viewPos = msg.viewPos;
+					break;
+				}
+				case DECODE_MSG_QUEUE_TYPE_RUN_ALL:
+				{//
+					memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+					pDecodeChannel.runStatus = FLAG_RUN;
+					break;
+				}
+				default:
+				{
+					break;
+				}
+			}
+		}
+	
+		
+		pFrameQueue = (stream_frame_queue_t *)networkGetStreamFrameQueue(pDecodeChannel.channelNo, pDecodeChannel.streamNo);
+		pFrame = streamGetFrameFromNetPool(pFrameQueue, &pDecodeChannel.readBegin, &pDecodeChannel.readEnd);
+		if(pFrame == NULL)
+		{
+			if(pDecodeChannel.runStatus != FLAG_RUN)
+			{
+				usleep(10*1000);
+			}
+			else
+			{
+				usleep(1*1000);
+			}
+			continue;
+		}
+
+		#if  1
+		if(pDecodeChannel.runStatus != FLAG_RUN)
+		{
+			streamFreeFrameBuffer(pFrameQueue, pFrame);
+			usleep(10*1000);
+			continue;
+		}
+		#endif
+		
+		if(pDecodeChannel.waitIFrame == 0)
+		{
+			if((pFrame->pFrameBuf[4] & 0x1F) == NAL_TYPE_SPS)
+			{
+				#if 1//sps
+				memcpy(streamBuffer, pFrame->pFrameBuf, sizeof(streamBuffer));
+				h264_sps(streamBuffer, &stSize.u32Width, &stSize.u32Height, &framerate);
+				s32Ret = HI_MPI_VDEC_GetChnAttr(pDecodeChannel.channelNo, &stVdecAttr);
+				if(s32Ret == HI_SUCCESS)
+				{
+					u32Width = stVdecAttr.u32PicWidth;
+					u32Height = stVdecAttr.u32PicHeight;
+				}
+				else
+				{
+					u32Width = 0;
+					u32Height = 0;
+				}
+				#ifdef HI3535
+				/*W&H Max, for 3535 */
+				stSize.u32Width = (stSize.u32Width > 2592) ? 2592 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height > 2592) ? 2592 : stSize.u32Height;
+				/*W&H Max, for rotate */
+				stSize.u32Width = MAX2(stSize.u32Width, stSize.u32Height);
+				stSize.u32Height = MAX2(stSize.u32Width, stSize.u32Height);
+				/*W&H Min 720*396 , for picture "NO VIDEO"*/
+				stSize.u32Width = (stSize.u32Width < 720) ? 720 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height < 720) ? 720 : stSize.u32Height;
+				#else
+				/*W&H Max, for 3520d */
+				stSize.u32Width = (stSize.u32Width > 1920) ? 1920 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height > 1080) ? 1080 : stSize.u32Height;
+				/*W&H Min 720*396 , for picture "NO VIDEO"*/
+				stSize.u32Width = (stSize.u32Width < 720) ? 720 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height < 396) ? 396 : stSize.u32Height;
+				#endif
+				
+				if(stSize.u32Width != 0)
+				{
+					if(stSize.u32Width != u32Width)
+					{
+						AppCreateVideo(pDecodeChannel.channelNo, &stSize);
+						Printf("u32Width = %d, u32Height = %d framerate = %d chn = %d\n", stSize.u32Width, stSize.u32Height, framerate, pDecodeChannel.channelNo);
+					}
+				}
+				#endif
+				
+				pDecodeChannel.waitIFrame = 1;
+				pDecodeChannel.frameNo = pFrame->frameHead.frameNo;
+			}
+			else
+			{
+				streamFreeFrameBuffer(pFrameQueue, pFrame);
+				usleep(1*1000);
+				continue;
+			}
+			
+		}
+		else
+		{
+			if(((pDecodeChannel.frameNo + 1) & 0xFFFF) != pFrame->frameHead.frameNo)
+			{//如果出现丢帧现象，则等待下一个I帧
+				Printf(" decode channel %d, lost frame %d ~ %d\r\n", pDecodeChannel.channelNo, pDecodeChannel.frameNo, pFrame->frameHead.frameNo);
+				pDecodeChannel.waitIFrame = 0;
+				streamFreeFrameBuffer(pFrameQueue, pFrame);
+				usleep(1*1000);
+				continue;
+			}
+		}
+		pDecodeChannel.frameNo = pFrame->frameHead.frameNo;
+
+		if(pFrame->frameHead.type == FRAME_TYPE_VIDEO)
+		{
+			if(pDecodeChannel.channelNo ==1)
+			{
+				//usleep(0);
+			}
+			//Printf("pDecodeChannel.channelNo =%d  pFrame->frameHead.frameNo =%d\n",pDecodeChannel.channelNo,pFrame->frameHead.frameNo);
+			hi_dec_sendStream(pDecodeChannel.channelNo, pFrame->pFrameBuf, pFrame->frameHead.len, 0);
+		}
+		streamFreeFrameBuffer(pFrameQueue, pFrame);	
+		
+		usleep(5*1000);	
+	}
+
+	return NULL;
+}
+
+/*用户图片*/
+void *decodeUserThread(void *arg)
+{
+	sleep(2);
+	struct  timeval tv_start;
+	struct  timeval tv_end;
+	VDEC_CHN_STAT_S stStatStart[MAX_DISPLAY_NUM] = {0};
+	VDEC_CHN_STAT_S stStatEnd[MAX_DISPLAY_NUM] = {0};
+	VPSS_GRP_ATTR_S stGrpAttr;
+	int i, TotalChn,ret;
+	
+	setPthreadPriority(PTHREAD_SCHEDULED_PRIORITY_LOW);
+	gettimeofday(&tv_start, NULL);
+	while(1)
+	{
+		gettimeofday(&tv_end, NULL);
+		if(tv_end.tv_sec - tv_start.tv_sec >= 5)
+		{
+			if(g_fullscreen == 1)
+			{
+				TotalChn = 1;
+			}
+			else
+			{
+				TotalChn = configGetDisplayNum();
+			}
+			
+			for(i=0; i<TotalChn; i++)
+			{
+				#ifdef HI3535
+				AppSetVpssToVoChnMode(i, 0, gs_AppDisplayNum); //for vo chn > 16
+				#endif
+				AppSetVpssToVdaChnMode(i, 2);//use mode for vda 
+				ret = HI_MPI_VDEC_Query(i, &stStatEnd[i]);
+				if(1)
+				{
+					if(stStatEnd[i].u32DecodeStreamFrames - stStatStart[i].u32DecodeStreamFrames != 0)
+					{
+						stStatStart[i].u32DecodeStreamFrames = stStatEnd[i].u32DecodeStreamFrames;
+					}
+					else
+					{
+						#ifdef HI3535
+						ret = HI_MPI_VPSS_GetGrpAttr(i, &stGrpAttr);
+						if(ret == HI_SUCCESS)
+						{
+							ret = HI_MPI_VPSS_SendFrame(i, &stFrame, 0);
+							if(ret != HI_SUCCESS)
+							{
+								//Printf("# HI_MPI_VPSS_SendFrame Chn %d error 0x%x\n", i, ret);
+							}
+						}
+						#else
+						ret = HI_MPI_VPSS_UserSendFrame(i, &stFrame);
+						if(ret != HI_SUCCESS)
+						{
+							//Printf("# HI_MPI_VPSS_SendFrame Chn %d error 0x%x\n", i, ret);
+						}
+						#endif
+					}
+				 }
+			}
+			tv_start.tv_sec = tv_end.tv_sec;
+		}
+		
+		sleep(1);
+	}
+}
+
+/* 获取解码线程运行标记 */
+int decodeGetRunFlag(int viewPos)
+{
+	int runFlag = 0;
+
+	if((viewPos >= 0) && (viewPos < configGetDisplayNum() + MAX_DISPLAY_EX_NUM))
+	{
+		pthread_mutex_lock(&g_devChannel[viewPos].mutex);
+		runFlag = g_devChannel[viewPos].runFlag;
+		pthread_mutex_unlock(&g_devChannel[viewPos].mutex);
+
+		return runFlag;
+	}
+
+	return 0;
+}
+
+/* 设置解码线程运行标记 */
+void decodeSetRunFlag(int viewPos, int value)
+{
+	if((viewPos >= 0) && (viewPos < configGetDisplayNum() + MAX_DISPLAY_EX_NUM))
+	{
+		pthread_mutex_lock(&g_devChannel[viewPos].mutex);
+		g_devChannel[viewPos].runFlag = value;
+		pthread_mutex_unlock(&g_devChannel[viewPos].mutex);
+	}
+}
+
+void decodeEableAudio(int flag)
+{
+	g_audioEnable = flag;
+}
+
+/* 开启解码 */
+int decodeStartDecode(int channelNo, int streamNo, int viewPos, int restartNetwork)
+{
+	link_queue_data_t decodeMsg = {0};
+
+	if(g_devChannel[viewPos].isUsed == 0)
+	{
+		g_devChannel[viewPos].isUsed = 1;
+		g_devChannel[viewPos].channelNo = channelNo&0xFF;
+		g_devChannel[viewPos].streamNo = streamNo&0xFF;
+		g_devChannel[viewPos].viewPos = viewPos;
+
+		if(g_fullscreen == 0)
+		{
+			decodeSetRunFlag(viewPos, FLAG_RUN);
+		}
+		else
+		{
+			decodeSetRunFlag(viewPos, FLAG_PAUSE);
+		}
+
+#if 0
+		networkStartStream(channelNo, streamNo, NETWORK_INVITE_TYPE_DECODE);
+#else
+		networkStartStream(channelNo, 0, NETWORK_INVITE_TYPE_DECODE);
+		networkStartStream(channelNo, 1, NETWORK_INVITE_TYPE_DECODE);
+#endif
+		{//
+			decode_msg_t msg = {0};
+
+			decodeMsg.type = DECODE_MSG_QUEUE_TYPE_ADD;
+			/* 插入录像工作线程消息队列 */
+			msg.channelNo = channelNo;
+			msg.streamNo = streamNo;
+			msg.viewPos = viewPos;
+			memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+			pthread_mutex_lock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+			queueLinkIn(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+			pthread_mutex_unlock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+		}
+	}
+	else
+	{
+		if(restartNetwork == 1)
+		{
+			Printf("restart network, channelNo %d, streamNo %d\r\n", channelNo, streamNo);
+			if(g_fullscreen == 0)
+			{
+				networkSetRunFlag(channelNo, streamNo, FLAG_RESTART);
+			}
+		}
+		else
+		{
+			decode_msg_t msg = {0};
+
+			if(g_fullscreen == 0)
+			{
+				decodeMsg.type = DECODE_MSG_QUEUE_TYPE_RUN;
+				/*  */
+				msg.channelNo = channelNo;
+				msg.streamNo = streamNo;
+				msg.viewPos = viewPos;
+				memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+				pthread_mutex_lock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+				queueLinkIn(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+				pthread_mutex_unlock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+			}
+		}
+	}
+
+	return 0;
+}
+
+
+/* 停止解码 */
+void decodeStopDecode(int viewPos)
+{
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+
+	if(g_devChannel[viewPos].isUsed == 1)
+	{
+		g_devChannel[viewPos].isUsed = 0;
+		decodeMsg.type = DECODE_MSG_QUEUE_TYPE_DEL;
+		/* 插入录像工作线程消息队列 */
+		msg.channelNo = g_devChannel[viewPos].channelNo;
+		msg.streamNo = g_devChannel[viewPos].streamNo;
+		msg.viewPos = viewPos;
+		memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+		pthread_mutex_lock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+		queueLinkIn(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+		pthread_mutex_unlock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+
+#if 0
+		networkStopStream(g_devChannel[viewPos].channelNo, g_devChannel[viewPos].streamNo, NETWORK_INVITE_TYPE_DECODE);
+#else
+		networkStopStream(g_devChannel[viewPos].channelNo, 0, NETWORK_INVITE_TYPE_DECODE);
+		//networkStopStream(g_devChannel[viewPos].channelNo, 0, NETWORK_INVITE_TYPE_RECORD);
+		networkStopStream(g_devChannel[viewPos].channelNo, 1, NETWORK_INVITE_TYPE_DECODE);
+#endif
+		g_devChannel[viewPos].isUsed = 0;
+	}
+}
+
+/* 获取当前窗口的状态，以及正在操作的通道号、流号 */
+int decodeGetCurViewChannelNoAndStreamNo(int viewPos, int *pChannelNo, int *pStreamNo)
+{
+	*pChannelNo = g_devChannel[viewPos].channelNo;
+	*pStreamNo = g_devChannel[viewPos].streamNo;
+
+	return g_devChannel[viewPos].isUsed;
+}
+
+void decodeSetViewChannelNoAndStreamNo(int viewPos, int channelNo, int streamNo)
+{
+	g_devChannel[viewPos].channelNo = channelNo;
+	g_devChannel[viewPos].streamNo = streamNo;
+}
+
+/* 停止所有解码 */
+void decodeStopAllDecode()
+{
+	int i = 0;
+
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+
+	decodeMsg.type = DECODE_MSG_QUEUE_TYPE_DEL_ALL;
+	/* 插入录像工作线程消息队列 */
+	memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+	for(i = 0; (i < MAX_DECODE_THREAD_NUM)&&(i < configGetDisplayNum()); i++)
+	{
+		pthread_mutex_lock(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgMutex);
+		queueLinkIn(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+		pthread_mutex_unlock(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgMutex);
+	}
+	for(i = 0; (i < MAX_DECODE_THREAD_NUM)&&(i < configGetDisplayNum()); i++)
+	{
+#if 0
+		networkStopStream(g_devChannel[i].channelNo, g_devChannel[i].streamNo, NETWORK_INVITE_TYPE_DECODE);
+#else
+		networkStopStream(g_devChannel[i%MAX_DECODE_THREAD_NUM].channelNo, 0, NETWORK_INVITE_TYPE_DECODE);
+		networkStopStream(g_devChannel[i%MAX_DECODE_THREAD_NUM].channelNo, 1, NETWORK_INVITE_TYPE_DECODE);
+#endif
+	}
+}
+
+/* 暂停解码 */
+void decodePauseDecode(int viewPos)
+{
+//	decodeSetRunFlag(viewPos, FLAG_PAUSE);
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+
+	decodeMsg.type = DECODE_MSG_QUEUE_TYPE_PAUSE;
+	/* 插入录像工作线程消息队列 */
+	msg.channelNo = g_devChannel[viewPos].channelNo;
+	msg.streamNo = g_devChannel[viewPos].streamNo;
+	msg.viewPos = viewPos;
+	memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+	pthread_mutex_lock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+	queueLinkIn(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+	pthread_mutex_unlock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+}
+
+/* 暂停所有解码 */
+void decodePauseAllDecode()
+{
+	int i = 0;
+
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+
+	decodeMsg.type = DECODE_MSG_QUEUE_TYPE_PAUSE_ALL;
+	/* 插入录像工作线程消息队列 */
+	memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+	for(i = 0; i < MAX_DECODE_THREAD_NUM; i++)
+	{
+		pthread_mutex_lock(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgMutex);
+		queueLinkIn(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+		pthread_mutex_unlock(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgMutex);
+	}
+}
+
+/* 恢复解码 */
+void decodeRestartDecode(int viewPos)
+{
+//	decodeSetRunFlag(viewPos, FLAG_RUN);
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+
+	decodeMsg.type = DECODE_MSG_QUEUE_TYPE_RUN;
+	/* 插入录像工作线程消息队列 */
+	msg.channelNo = g_devChannel[viewPos].channelNo;
+	msg.streamNo = g_devChannel[viewPos].streamNo;
+	msg.viewPos = viewPos;
+	memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+	pthread_mutex_lock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+	queueLinkIn(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+	pthread_mutex_unlock(&decodeThreadInfo[viewPos%MAX_DECODE_THREAD_NUM].msgMutex);
+}
+
+/* 恢复所有解码 */
+void decodeRestartAllDecode()
+{
+	int i = 0;
+
+	decodeLibReset(g_resolution, g_viewDisplayNum);
+
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+
+	decodeMsg.type = DECODE_MSG_QUEUE_TYPE_RUN_ALL;
+	/* 插入录像工作线程消息队列 */
+	memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+	for(i = 0; i < MAX_DECODE_THREAD_NUM; i++)
+	{
+		pthread_mutex_lock(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgMutex);
+		queueLinkIn(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgQueue, decodeMsg);
+		pthread_mutex_unlock(&decodeThreadInfo[i%MAX_DECODE_THREAD_NUM].msgMutex);
+	}
+}
+
+/* 等待单个解码线程的运行状态 */
+void decodeWaitRunFlag(int viewPos, int runFlag)
+{
+	while(1)
+	{
+		usleep(5*1000);
+
+		if(decodeGetRunFlag(viewPos) == runFlag)
+		{
+			break;
+		}
+	}
+}
+
+/* 等待所有解码线程的运行状态 */
+void decodeWaitAllRunFlag(int runFlag)
+{
+	int i = 0;
+
+	while(1)
+	{
+		usleep(5*1000);
+
+		for(i = 0; i < configGetDisplayNum(); i++)
+		{
+			if(decodeGetRunFlag(i) != runFlag)
+			{
+				break;
+			}
+		}
+
+		if(i == configGetDisplayNum())
+		{
+			break;
+		}
+	}
+}
+
+#if 0
+void decodeLibSetDisplayNum(int displayNum)
+{
+	g_viewDisplayNum = displayNum;
+}
+#endif
+
+
+/* 全屏某个窗口 */
+int decodeLibFullScreen(int viewPos)
+{
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 1);
+	decodeStartDecode(g_devChannel[viewPos].channelNo, 0, configGetDisplayNum(), 0);
+	g_fullscreen = 1;
+	decodeRestartDecode(configGetDisplayNum());
+
+	return 0;
+}
+
+/* 取消全屏某个窗口 */
+int decodeLibFullScreenDisable(int viewPos)
+{
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, g_viewDisplayNum);
+
+	g_fullscreen = 0;
+	decodeRestartAllDecode();
+
+	return 0;
+}
+
+/* 4窗口 */
+int decodeLibFourScreen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 4);
+	g_viewDisplayNum = 4;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 4 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+
+	return 0;
+}
+
+/* 6窗口 */
+int decodeLibSixScreen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 6);
+	g_viewDisplayNum = 6;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 6 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+	return 0;
+}
+
+/* 8窗口 */
+int decodeLibEightScreen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 8);
+	g_viewDisplayNum = 8;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 8 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+
+	return 0;
+}
+
+/* 9窗口 */
+int decodeLibNineScreen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 9);
+	g_viewDisplayNum = 9;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 9 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+	return 0;
+}
+
+/* 16窗口 */
+int decodeLibSixteenScreen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 16);
+	g_viewDisplayNum = 16;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 16 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+	return 0;
+}
+
+/* 24窗口 */
+int decodeLib24Screen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 24);
+	g_viewDisplayNum = 24;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 24 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+	return 0;
+}
+
+/* 25窗口 */
+int decodeLib25Screen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 25);
+	g_viewDisplayNum = 25;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 25 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+	return 0;
+}
+
+/* 36窗口 */
+int decodeLib36Screen(int viewPos)
+{
+	int i = 0;
+
+	g_fullscreen = 0;
+	playbackStopAll();
+	decodeStopDecode(configGetDisplayNum());//停止全屏的解码线程
+	decodePauseAllDecode();
+	decodeWaitAllRunFlag(FLAG_PAUSE);
+
+	decodeLibReset(g_resolution, 32);
+	g_viewDisplayNum = 32;
+	g_offsetView = viewPos;
+
+	for(i = viewPos; i < 32 + viewPos; i++)
+	{
+		decodeRestartDecode(i);
+	}
+
+	return 0;
+}
+
+/* 获取分屏数 */
+int decodeGetDisplayNum()
+{
+	return g_viewDisplayNum;
+}
+
+int decodeLibReset(int resolution, int displayNum)
+{
+	#if  1
+	int i = 0;
+	int picSize = PIC_D1;
+
+	if(resolution == 0)
+	{
+		resolution = g_resolution;
+	}
+
+
+	hi_dec_closeAllChannel(configGetDisplayNum());//displayNum);
+	for(i = 0; (i < configGetDisplayNum()) && (i < MAX_DISPLAY_NUM); i++)
+	{
+		hi_dec_decBindVpss(i, HI_FALSE);
+		hi_dec_voBindVpss(i, HI_FALSE);
+	}
+	hi_dec_vpssStop(configGetDisplayNum());//displayNum);
+	hi_dec_setDisplayNum(resolution, displayNum);
+	if((configGetCpuType() == CPU_3531)||(configGetCpuType()==CPU_3535))
+	{
+		if(displayNum == 1)		picSize = PIC_HD1080;
+		else if(displayNum == 4)	picSize = PIC_HD1080;
+		else if(displayNum == 6)	picSize = PIC_HD1080;
+		else if(displayNum == 8)	picSize = PIC_HD720;//PIC_HD720;
+		else if(displayNum == 9)	picSize = PIC_HD720;
+		else if(displayNum == 16)
+		{
+			if(configGetDisplayNum()<=16)	picSize = PIC_HD720;
+			else							picSize = PIC_D1;
+		}
+		else if(displayNum == 24)	picSize = PIC_D1;
+		else if(displayNum == 25)	picSize = PIC_D1;
+		else if(displayNum == 32)	picSize = PIC_D1;
+		else				picSize = PIC_D1;
+	}
+	else if((configGetCpuType() == CPU_3520A)||(configGetCpuType() ==CPU_3520D))
+	{
+		if(displayNum == 1)		picSize = PIC_HD1080;
+		else if(displayNum == 4)	picSize = PIC_HD720;
+		else if(displayNum == 6)	picSize = PIC_D1;
+		else if(displayNum == 8)	picSize = PIC_D1;
+		else if(displayNum == 9)	picSize = PIC_D1;
+		else if(displayNum == 16)	picSize = PIC_D1;
+		else if(displayNum == 25)	picSize = PIC_D1;
+		else if(displayNum == 32)	picSize = PIC_D1;
+		else				picSize = PIC_D1;
+	}
+	else if(configGetCpuType() == CPU_3521)
+	{
+		if(displayNum == 1)		picSize = PIC_HD1080;
+		else if(displayNum == 4)	picSize = PIC_HD1080;
+		else if(displayNum == 6)	picSize = PIC_HD720;
+		else if(displayNum == 8)	picSize = PIC_HD720;
+		else if(displayNum == 9)	picSize = PIC_HD720;
+		else if(displayNum == 16)	picSize = PIC_D1;
+		else if(displayNum == 25)	picSize = PIC_D1;
+		else if(displayNum == 32)	picSize = PIC_D1;
+		else				picSize = PIC_D1;
+	}
+	else
+	{
+		if(displayNum == 1)		picSize = PIC_HD1080;
+		else if(displayNum == 4)	picSize = PIC_HD720;
+		else if(displayNum == 6)	picSize = PIC_D1;
+		else if(displayNum == 8)	picSize = PIC_D1;
+		else if(displayNum == 9)	picSize = PIC_D1;
+		else if(displayNum == 16)	picSize = PIC_D1;
+		else if(displayNum == 24)	picSize = PIC_D1;
+		else if(displayNum == 25)	picSize = PIC_D1;
+		else if(displayNum == 32)	picSize = PIC_D1;
+		else				picSize = PIC_D1;
+	}
+
+	hi_dec_vpssStart(displayNum, picSize);//PIC_HD1080);
+	if(displayNum > MAX_DISPLAY_NUM)
+	{
+		displayNum = MAX_DISPLAY_NUM;
+	}
+
+	for(i = 0; i < displayNum; i++)
+	{
+		hi_dec_voBindVpss(i, HI_TRUE);
+		hi_dec_openChannel(i, PT_H264, picSize);//PIC_HD1080);//PIC_D1);
+		hi_dec_decBindVpss(i, HI_TRUE);
+	}
+	#endif
+
+	return 0;
+}
+
+/* 解码库初始化 */
+int decodeLibInit(int resolution, int displayNum)
+{
+	#if 0
+	AppStartVideo();
+	#endif
+	#if 1
+	
+	int i = 0;
+	int encodeMode = 0;
+
+	AppSysInit();
+	AppVoInit();
+	
+	appParamGetResolution(&resolution, &encodeMode);
+	Printf("ccccccccccccccccccccc resolution %d, displayNum %d\r\n", resolution, displayNum);
+
+	if(pthread_create(&g_userThreadId, NULL, decodeUserThread, NULL) < 0)
+	{
+		Printf("pthread_create  decodeUserThread  fail\n");
+	}
+	#if 1
+	#if USED_THREAD_POOL
+	for(i=0;(i<MAX_DECODE_THREAD_NUM)&&(i<configGetDisplayNum());i++)
+	{
+		pthread_mutex_init(&decodeThreadInfo[i].msgMutex, NULL);
+		queueLinkInit(&decodeThreadInfo[i].msgQueue);
+
+		if(threadPoolAddWorker(NULL, decodeThread, (char *)&i, sizeof(i)) != 0)
+		{
+			Printf("invite channelNo, streamNo  stream error\r\n");
+			exit(0);
+		}
+	}
+	#else
+	for(i = 0; (i < MAX_DECODE_THREAD_NUM)&&(i<configGetDisplayNum()); i++)
+	{
+		pthread_mutex_init(&decodeThreadInfo[i].msgMutex, NULL);
+		queueLinkInit(&decodeThreadInfo[i].msgQueue);
+
+		if(pthread_create(&g_decodeThreadId[i], NULL, decodeThread, (void *)i) < 0)
+		{
+			exit(0);
+		}
+	}
+	#endif
+	#endif
+
+	memset(&g_devChannel, 0, sizeof(g_devChannel));
+	
+	for(i = 0; i < configGetDisplayNum() + MAX_DISPLAY_EX_NUM; i++)
+	{
+		pthread_mutex_init(&g_devChannel[i].mutex, NULL);
+		g_devChannel[i].channelNo = -1;
+		g_devChannel[i].streamNo = -1;
+	}
+
+	g_viewDisplayNum = displayNum;
+	g_resolution = resolution;
+
+	#if 1 //ssf
+	hi_vpss_GetUserPic(UserPicName, &stFrame);
+	#endif
+#endif	
+	return 0;
+}
+
+/* 解码库销毁 */
+void decodeLibdestroy(int displayNum)
+{
+	int i = 0;
+
+	if(displayNum > MAX_DISPLAY_NUM)
+	{
+		displayNum = MAX_DISPLAY_NUM;
+	}
+
+	hi_dec_closeAllChannel(displayNum);
+
+	for(i = 0; i < displayNum; i++)
+	{
+		hi_dec_decBindVpss(i, HI_FALSE);
+		hi_dec_voBindVpss(i, HI_FALSE);
+	}
+
+	hi_dec_vpssStop(displayNum);
+	hi_dec_voStop();
+	hi_dec_mppDestroy();
+
+	for(i = 0; i < configGetDisplayNum() + MAX_DISPLAY_EX_NUM; i++)
+	{
+		pthread_mutex_destroy(&g_devChannel[i].mutex);
+	}
+
+	for(i = 0; i < MAX_DECODE_THREAD_NUM; i++)
+	{
+		pthread_mutex_lock(&decodeThreadInfo[i].msgMutex);
+		queueLinkDestroy(&decodeThreadInfo[i].msgQueue);
+		pthread_mutex_unlock(&decodeThreadInfo[i].msgMutex);
+
+		pthread_mutex_destroy(&decodeThreadInfo[i].msgMutex);
+	}
+}
+
+#if 1 //ssf
+/*****************************
+*create process : vdec -> vpss -> vo
+*destroy process : vo -> vpss ->vdec
+******************************/
+
+
+int AppCreateVideo(int channelNo, SIZE_S *pstSize)
+{
+	////////////////////////////////
+	/*start vdec*/
+	AppStartVdec(channelNo, pstSize);
+	/*start vpss*/
+	AppResetVpss(channelNo, pstSize);
+	/*binding*/
+	AppVpssBindVdecEx(channelNo, HI_TRUE);
+
+	return 0;	
+}
+
+int AppDestroyVideo(int channelNo)
+{
+	SIZE_S stSize;
+
+	stSize.u32Width = 720;
+	stSize.u32Height = 720;
+	
+	/*stop vdec*/
+	AppStopVdec(channelNo);
+	/*reset vpss*/
+	AppResetVpss(channelNo, &stSize);
+	return 0;
+}
+
+
+#if 0
+typedef struct hiVDEC_VDEC_PARAM_S
+{
+	HI_BOOL bThreadStart;
+	unsigned char runStatus;//运行状态
+	unsigned char channelNo;//通道号
+	unsigned char streamNo;//主子码流
+
+	int waitIFrame;
+	int frameNo;
+	int readBegin;
+	int readEnd;
+}VDEC_PARAM_CHN_S;
+
+VDEC_PARAM_CHN_S gs_stVdecChnParam[64];
+
+int SetVdecParamInit(int channelNo)
+{
+	gs_stVdecChnParam[channelNo].bThreadStart = HI_FALSE;
+	gs_stVdecChnParam[channelNo].runStatus = FLAG_EXIT;
+	gs_stVdecChnParam[channelNo].channelNo = channelNo;
+	gs_stVdecChnParam[channelNo].streamNo = 1;
+	gs_stVdecChnParam[channelNo].waitIFrame = 0;
+	gs_stVdecChnParam[channelNo].frameNo = 0;
+	gs_stVdecChnParam[channelNo].readBegin = -2;
+	gs_stVdecChnParam[channelNo].readEnd = -2;
+
+	return 0;
+}
+
+int SetVdecParam(int channelNo, int streamNo, int runStatus)
+{
+	gs_stVdecChnParam[channelNo].runStatus = runStatus;
+	gs_stVdecChnParam[channelNo].channelNo = channelNo;
+	gs_stVdecChnParam[channelNo].streamNo = streamNo;
+	
+	return 0;
+}
+
+#ifdef USED_THREAD_POOL
+void * StartVdecSendStream(void *arg, int argLen)
+#else
+void *StartVdecSendStream(void *arg)
+#endif
+{
+	HI_S32 s32Ret;
+	stream_frame_t * pFrame = NULL;
+	stream_frame_queue_t *pFrameQueue = NULL;
+	VDEC_PARAM_CHN_S stVdecChnParam;
+	struct  timeval tv_start = {0};
+	struct  timeval tv_end = {0};
+	int sleepTime = 0, tmpTime = 0;
+	SIZE_S stSize;
+	int framerate = 30;
+	char streamBuffer[256] = {0};
+	VDEC_CHN_ATTR_S stVdecAttr = {0};
+	int channelNo = 0; 
+	int u32Width;
+	int u32Height;
+
+	memcpy(&channelNo, arg, sizeof(channelNo));
+	setPthreadPriority(PTHREAD_SCHEDULED_PRIORITY_HIGH_EST);//
+	
+	while(stVdecChnParam.bThreadStart == HI_TRUE)
+	{
+		pFrameQueue = (stream_frame_queue_t *)networkGetStreamFrameQueue(stVdecChnParam.channelNo, stVdecChnParam.streamNo);
+		pFrame = streamGetFrameFromNetPool(pFrameQueue, &stVdecChnParam.readBegin, &stVdecChnParam.readEnd);
+		if(pFrame == NULL)
+		{
+			usleep(1*1000);
+			continue;
+		}
+		//Printf("######### stVdecChnParam.runStatus = %d, stVdecChnParam.channelNo = %d, stVdecChnParam.streamNo = %d\n", stVdecChnParam.runStatus, stVdecChnParam.channelNo, stVdecChnParam.streamNo);
+		if(stVdecChnParam.runStatus != FLAG_RUN)
+		{
+			streamFreeFrameBuffer(pFrameQueue, pFrame);
+			usleep(10*1000);
+			continue;
+		}
+		
+		if(stVdecChnParam.waitIFrame == 0)
+		{
+			if((pFrame->pFrameBuf[4] & 0x1F) == NAL_TYPE_SPS)
+			{
+				#if 1//sps
+				memcpy(streamBuffer, pFrame->pFrameBuf, sizeof(streamBuffer));
+				h264_sps(streamBuffer, &stSize.u32Width, &stSize.u32Height, &framerate);
+				s32Ret = HI_MPI_VDEC_GetChnAttr(stVdecChnParam.channelNo, &stVdecAttr);
+				if(s32Ret == HI_SUCCESS)
+				{
+					u32Width = stVdecAttr.u32PicWidth;
+					u32Height = stVdecAttr.u32PicHeight;
+				}
+				else
+				{
+					u32Width = 0;
+					u32Height = 0;
+				}
+				#ifdef HI3535
+				/*W&H Max, for 3535 */
+				stSize.u32Width = (stSize.u32Width > 2592) ? 2592 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height > 2592) ? 2592 : stSize.u32Height;
+				/*W&H Max, for rotate */
+				stSize.u32Width = MAX2(stSize.u32Width, stSize.u32Height);
+				stSize.u32Height = MAX2(stSize.u32Width, stSize.u32Height);
+				/*W&H Min 720*396 , for picture "NO VIDEO"*/
+				stSize.u32Width = (stSize.u32Width < 720) ? 720 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height < 720) ? 720 : stSize.u32Height;
+				#else
+				/*W&H Max, for 3520d */
+				stSize.u32Width = (stSize.u32Width > 1920) ? 1920 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height > 1080) ? 1080 : stSize.u32Height;
+				/*W&H Min 720*396 , for picture "NO VIDEO"*/
+				stSize.u32Width = (stSize.u32Width < 720) ? 720 : stSize.u32Width;
+				stSize.u32Height = (stSize.u32Height < 396) ? 396 : stSize.u32Height;
+				#endif
+				
+				if(stSize.u32Width != 0)
+				{
+					if(stSize.u32Width != u32Width)
+					{
+						AppCreateVideo(stVdecChnParam.channelNo, &stSize);
+						Printf("u32Width = %d, u32Height = %d framerate = %d chn = %d\n", stSize.u32Width, stSize.u32Height, framerate, stVdecChnParam.channelNo);
+					}
+				}
+				#endif
+				
+				stVdecChnParam.waitIFrame = 1;
+				stVdecChnParam.frameNo = pFrame->frameHead.frameNo;
+			}
+			else
+			{
+				streamFreeFrameBuffer(pFrameQueue, pFrame);
+				usleep(0);
+				continue;
+			}
+			
+		}
+		else
+		{
+			if(((stVdecChnParam.frameNo + 1) & 0xFFFF) != pFrame->frameHead.frameNo)
+			{//如果出现丢帧现象，则等待下一个I帧
+				Printf(" decode channel %d, lost frame %d ~ %d\r\n", stVdecChnParam.channelNo, stVdecChnParam.frameNo, pFrame->frameHead.frameNo);
+				stVdecChnParam.waitIFrame = 0;
+				streamFreeFrameBuffer(pFrameQueue, pFrame);
+				usleep(1*1000);
+				continue;
+			}
+		}
+		#if 0
+		gettimeofday(&tv_end, NULL);
+		tmpTime = (tv_end.tv_sec*1000000 + tv_end.tv_usec) - (tv_start.tv_sec*1000000 + tv_start.tv_usec);
+		sleepTime = (1000/50)*1000 - tmpTime;
+		if(sleepTime > 0 && ((pFrame->pFrameBuf[4] & 0x1F) != NAL_TYPE_SEI))
+		{
+			usleep(sleepTime);
+		}
+		tv_start.tv_sec = tv_end.tv_sec;
+		tv_start.tv_usec = tv_end.tv_usec;
+		#endif		
+		stVdecChnParam.frameNo = pFrame->frameHead.frameNo;
+
+		if(pFrame->frameHead.type == FRAME_TYPE_VIDEO)
+		{
+			hi_dec_sendStream(stVdecChnParam.channelNo, pFrame->pFrameBuf, pFrame->frameHead.len, 0);
+		}
+		streamFreeFrameBuffer(pFrameQueue, pFrame);	
+		
+		usleep(10*1000);	
+	}
+	
+	return NULL;
+}
+
+
+int CreateVdecSendStreamThread(int channelNo, int streamNo)
+{
+	if(gs_stVdecChnParam[channelNo].bThreadStart == HI_FALSE)
+	{
+		gs_stVdecChnParam[channelNo].bThreadStart = HI_TRUE;
+		gs_stVdecChnParam[channelNo].runStatus = FLAG_RUN;
+		gs_stVdecChnParam[channelNo].channelNo = channelNo;
+		gs_stVdecChnParam[channelNo].streamNo = streamNo;
+		#ifdef USED_THREAD_POOL
+		if(threadPoolAddWorker(NULL, StartVdecSendStream, &channelNo, sizeof(channelNo))< 0)
+		{
+			Printf("Send stream thread error\r\n");
+			exit(1);
+		}
+		#else
+		if(pthread_create(&g_decodeThreadId[channelNo], NULL, StartVdecSendStream, &gs_stVdecChnParam[channelNo]) < 0)
+		{
+			Printf("Send stream thread error\r\n");
+			exit(1);
+		}
+		#endif
+	}
+
+	return 0;
+}
+
+
+int DestroyVdecSendStreamThread(int channelNo)
+{
+	/* join thread */
+	if (HI_TRUE == gs_stVdecChnParam[channelNo].bThreadStart)
+	{
+		printf("############# Destroy thread id %d Chn %d\n", channelNo, channelNo);
+		gs_stVdecChnParam[channelNo].bThreadStart = HI_FALSE;
+		/*stop vdec*/
+		AppDestroyVideo(channelNo);
+		#ifdef USED_THREAD_POOL
+		#else
+		pthread_join(g_decodeThreadId[channelNo], 0);
+		#endif
+	}
+
+	return 0;
+}
+
+void *ManageVdecThread(void *arg)
+{
+	int i;
+	int ret = 0;
+	int no = 0;
+	link_queue_data_t decodeMsg = {0};
+	
+	for(i=0;(i<MAX_DECODE_THREAD_NUM)&&(i<configGetDisplayNum());i++)
+	{
+		pthread_mutex_init(&decodeThreadInfo[i].msgMutex, NULL);
+		queueLinkInit(&decodeThreadInfo[i].msgQueue);
+		SetVdecParamInit(i);
+	}
+	sleep(5);
+	while(1)
+	{
+		for(i=0;(i<MAX_DECODE_THREAD_NUM)&&(i<configGetDisplayNum());i++)
+		{
+			no = i;
+			memset(&decodeMsg, 0, sizeof(link_queue_data_t));
+			/* 监测管理线程消息队列 */
+			pthread_mutex_lock(&decodeThreadInfo[no].msgMutex);
+			ret = queueLinkOut(&decodeThreadInfo[no].msgQueue, &decodeMsg);
+			pthread_mutex_unlock(&decodeThreadInfo[no].msgMutex);
+			
+			if(ret == 0)
+			{
+				//接收到消息
+				switch(decodeMsg.type)
+				{
+					case DECODE_MSG_QUEUE_TYPE_ADD:
+					{//增加
+						decode_msg_t msg = {0};
+						memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+						Printf("############# create vdec chn %d streamNo %d\n", msg.channelNo, msg.streamNo);
+						CreateVdecSendStreamThread(msg.channelNo, msg.streamNo);
+						SetVdecParam(msg.channelNo, msg.streamNo, FLAG_RUN);
+						break;
+					}
+					case DECODE_MSG_QUEUE_TYPE_DEL:
+					case DECODE_MSG_QUEUE_TYPE_DEL_ALL:
+					{//删除
+						decode_msg_t msg = {0};
+						memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+						Printf("############# exit vdec chn %d streamNo %d\n", msg.channelNo, msg.streamNo);
+						SetVdecParam(msg.channelNo, msg.streamNo, FLAG_EXIT);
+						DestroyVdecSendStreamThread(msg.channelNo);
+						break;
+					}
+					case DECODE_MSG_QUEUE_TYPE_PAUSE:
+					case DECODE_MSG_QUEUE_TYPE_PAUSE_ALL:
+					{//暂停
+						decode_msg_t msg = {0};
+						memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+						Printf("############# pause vdec chn %d streamNo %d\n", msg.channelNo, msg.streamNo);
+						SetVdecParam(msg.channelNo, msg.streamNo, FLAG_PAUSE);
+						break;
+					}
+					case DECODE_MSG_QUEUE_TYPE_RUN:
+					case DECODE_MSG_QUEUE_TYPE_RUN_ALL:
+					{//运行
+						decode_msg_t msg = {0};
+						memcpy(&msg, decodeMsg.data, sizeof(decode_msg_t));
+						Printf("############# start vdec chn %d streamNo %d\n", msg.channelNo, msg.streamNo);
+						SetVdecParam(msg.channelNo, msg.streamNo, FLAG_RUN);
+						break;
+					}
+					default:
+					{
+						break;
+					}
+				}
+			}
+		}
+		usleep(5*1000);
+	}
+	return NULL;
+}
+
+int AppStartVideo()
+{
+	HI_S32 i;
+	AppSysInit();
+	AppVoInit();
+	
+	
+	#if 0
+	for(i = 0; i < MAX_DECODE_THREAD_NUM; i++)
+	{
+		pthread_mutex_init(&decodeThreadInfo[i].msgMutex, NULL);
+		queueLinkInit(&decodeThreadInfo[i].msgQueue);
+		if(pthread_create(&g_decodeThread, NULL, ManageVdecThread, (void *)i) < 0)
+		{
+			exit(0);
+		}
+	}
+	#endif
+	
+	#if 1
+	//for(i = 0; i < MAX_DECODE_THREAD_NUM; i++)
+	{
+		if(pthread_create(&g_decodeThread, NULL, ManageVdecThread, NULL) < 0)
+		{
+			exit(0);
+		}
+	}
+	#endif
+	//SwitchScreenDisplay(0, configGetDisplayNum());
+	sleep(2);
+	hi_vpss_GetUserPic(UserPicName, &stFrame);
+	if(pthread_create(&g_userThreadId, NULL, decodeUserThread, NULL) < 0)
+	{
+		Printf("pthread_create  decodeUserThread  fail\n");
+	}
+
+	return 0;
+}
+#endif
+
+/* 画面切换(连续多个画面)*/
+int SwitchScreenDisplay(int ViewPos, int DisplayNum)
+{
+	HI_S32 i;
+	HI_S32 channelNo;
+	int DisplayChn;
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+	
+	#ifdef HI3535
+	DisplayChn = (DisplayNum == 25) ? 24 : DisplayNum;
+	#else
+	DisplayChn = (DisplayNum == 9) ? 8 : DisplayNum;
+	#endif
+	
+	/***************stop*************/
+	//pause recv stream
+	for(i = 0; i < configGetDisplayNum(); i++)
+	{
+		channelNo = i;
+		decodeMsg.type = DECODE_MSG_QUEUE_TYPE_PAUSE;
+		/* 插入录像工作线程消息队列 */
+		msg.channelNo = channelNo;
+		msg.streamNo = g_devChannel[channelNo].streamNo;
+		msg.viewPos = ViewPos;
+		memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+		pthread_mutex_lock(&decodeThreadInfo[channelNo].msgMutex);
+		queueLinkIn(&decodeThreadInfo[channelNo].msgQueue, decodeMsg);
+		pthread_mutex_unlock(&decodeThreadInfo[channelNo].msgMutex);
+	}
+	//stop vo chn
+	AppStopAllVo();
+	//stop vpss chn
+	AppStopAllVpss();
+	//stop vdec chn
+	AppStopAllVdec();
+	
+	//start vpss chn
+	AppStartVpss(ViewPos,DisplayChn);
+	//start vo chn
+	AppStartVo(ViewPos,DisplayNum, DisplayChn);
+	//start recv stream
+	for(i = 0; i < DisplayChn; i++)
+	{
+		channelNo = ViewPos + i;
+		decodeMsg.type = DECODE_MSG_QUEUE_TYPE_RUN;
+		/* 插入录像工作线程消息队列 */
+		msg.channelNo = channelNo;
+		if(DisplayChn == 1)
+		{
+			msg.streamNo = 0;
+		}
+		else
+		{
+			msg.streamNo = g_devChannel[channelNo].streamNo;
+		}
+		msg.viewPos = ViewPos;
+		memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+		pthread_mutex_lock(&decodeThreadInfo[channelNo].msgMutex);
+		queueLinkIn(&decodeThreadInfo[channelNo].msgQueue, decodeMsg);
+		pthread_mutex_unlock(&decodeThreadInfo[channelNo].msgMutex);
+	}
+	gs_AppDisplayNum = DisplayNum;
+	return 0;
+}
+
+
+
+/* 画面切换(回放)*/
+/* 画面切换(回放)*/
+int SwitchScreenPlayBackDisplay(int chn[4], int DisplayNum)
+{
+	HI_S32 i;
+	VDEC_CHN VdecCnh;
+	
+	link_queue_data_t decodeMsg = {0};
+	decode_msg_t msg = {0};
+	HI_S32 channelNo;
+	gs_AppDisplayNum = DisplayNum;
+	/***************stop*************/
+	//stop recv stream
+	//pause recv stream
+	for(i = 0; i < configGetDisplayNum(); i++)
+	{
+		channelNo = i;
+		decodeMsg.type = DECODE_MSG_QUEUE_TYPE_PAUSE;
+		/* 插入录像工作线程消息队列 */
+		msg.channelNo = channelNo;
+		msg.streamNo = g_devChannel[channelNo].streamNo;
+		msg.viewPos = 0;
+		memcpy(decodeMsg.data, &msg, sizeof(decode_msg_t));
+
+		pthread_mutex_lock(&decodeThreadInfo[channelNo].msgMutex);
+		queueLinkIn(&decodeThreadInfo[channelNo].msgQueue, decodeMsg);
+		pthread_mutex_unlock(&decodeThreadInfo[channelNo].msgMutex);
+	}
+	//stop vo chn
+	AppStopAllVo();
+	//stop vpss chn
+	AppStopAllVpss();
+	//stop vdec chn
+	AppStopAllVdec();
+	
+	/**************start**************/
+	for(i = 0; i < DisplayNum; i++)
+	{
+		//start vdec chn
+		AppPlayBackStartVdec(chn[i]);
+		//start vpss chn
+		AppPlayBackStartVpss(chn[i]);
+	}
+	//start vo chn
+	AppPlayBackStartVo(chn, DisplayNum);
+
+	return 0;
+}
+
+
+
+
+/* 实时(回放)*/
+int RealTimePlayBackDisplay(int chn)
+{
+	//SetVdecParam(chn, 1, FLAG_PAUSE);
+	return 0;
+}
+
+#endif
+

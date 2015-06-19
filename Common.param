@@ -1,0 +1,90 @@
+
+include ../Makefile.param
+
+INC_FLAGS := -I$(REL_INC)\
+	     -I$(SDK_PATH)/component/hifb/include
+INC_FLAGS += -I$(REL_INC) -I$(SDK_PATH)/$(EXTDRV)/tw2865 -I$(SDK_PATH)/$(EXTDRV)/tw2960 -I$(SDK_PATH)/$(EXTDRV)/tlv320aic31 -I$(SDK_PATH)/$(EXTDRV)/tlv320aic23
+
+CFLAGS := -Wall -g -O2 -fPIC #-static 
+#CFLAGS := -Wall -g  -fPIC #-static 
+CFLAGS += -DSQLITE_OMIT_LOAD_EXTENSION
+CFLAGS += $(INC_FLAGS) -D$(CPU_TYPE)  #-D$(HIARCH) #-DHICHIP=$(HICHIP) -DSENSOR_TYPE=$(SENSOR_TYPE) -D$(HIDBG) -D$(HI_FPGA) -D$(CHIP_TYPE)
+#CFLAGS += -lpthread -lm -ldl
+
+ifeq ($(CC), gcc)
+CFLAGS += -DX86
+endif
+
+ifeq ($(HIARCH),hi3531)
+ifneq ($(CC), gcc)
+CFLAGS += -march=armv7-a -mcpu=cortex-a9 -mfloat-abi=softfp -mfpu=vfpv3-d16
+CXXFlAGS +=-march=armv7-a -mcpu=cortex-a9 -mfloat-abi=softfp -mfpu=vfpv3-d16
+endif
+endif
+
+CFLAGS += -DNCX_PTR_SIZE=4
+
+
+
+#找出当前目录下所有的.c文件
+CSOURCE:=$(shell find . -type f -name "*.c")
+
+#生成.c文件对应的.o文件
+OBJECTS:=$(subst .c,.o,$(CSOURCE))
+
+CFLAGS += -I../include/ -I./ -I../
+CFLAGS += -I../libevent/include
+CFLAGS += -I../appLib  -I../appLib/ddnsLib  -I../appLib/smtpLib  -I../appLib/ntpLib  -I../appLib/ptzLib/include  -I../appLib/ftpLib
+CFLAGS += -I../codeLib
+CFLAGS += -I../commonLib
+CFLAGS += -I../diskLib
+
+ifneq ($(CC), gcc)
+CFLAGS += -I../decodeLib
+CFLAGS += -I../hiLib
+endif
+
+CFLAGS += -I../myThreadLib
+CFLAGS += -I../configLib
+CFLAGS += -I../networkLib
+CFLAGS += -I../queueLib
+CFLAGS += -I../recordLib
+CFLAGS += -I../privateLib
+CFLAGS += -I../playbackLib
+CFLAGS += -I../rtspCLib
+CFLAGS += -I../rtspSLib
+CFLAGS += -I../streamLib
+CFLAGS += -I../databaseLib
+CFLAGS += -I../procMsgLib
+CFLAGS += -I../myEvLib
+CFLAGS += -I../diskLib
+CFLAGS += -I../gpioLib
+CFLAGS += -I../logLib
+CFLAGS += -I../onvif
+CFLAGS += -I../sqlite
+CFLAGS += -I../aviLib
+CFLAGS += -I../guiServerLib
+CFLAGS += -I../alarmLib
+CFLAGS += -I../boaLib
+CFLAGS += -I../boaLib/include
+CFLAGS += -I../mempoolLib
+CFLAGS += -I../phoneLib
+CFLAGS += -I../p2pLib
+
+#plat
+CFLAGS += -I../platLib/include/common/include  
+CFLAGS += -I../platLib/include/common/lib/ftp/include  
+CFLAGS += -I../platLib/include/interface/include 
+CFLAGS += -I../platLib/include/huashida/include 
+CFLAGS += -I../platLib/include/media_serv/include  
+CFLAGS += -I../platLib/include/platform_serv/include  
+CFLAGS += -I../platLib/include/rtsp_serv/include  
+CFLAGS += -I../platLib/include/ftp_serv/include  
+CFLAGS += -I../platLib/include/p2p_mobile/include  
+CFLAGS += -I../platLib/include/bcast_serv/include 
+CFLAGS += -I../platLib/include/media_serv/mobile_msg_push/include
+
+#28181
+CFLAGS += -I../28181Lib
+CFLAGS += -I../28181Lib/inc
+

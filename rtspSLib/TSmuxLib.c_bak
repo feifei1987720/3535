@@ -1,0 +1,1171 @@
+/******************************************************************************
+  File Name 		: tsmux.cpp
+  Version		: Initial Draft
+  Created		: 2011/06/14
+  Last Modified 	:
+  Description		: Ts pack
+  Function List 	:
+  History			:
+
+******************************************************************************/
+
+//#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <memory.h>
+#include <stdint.h>
+
+#include <sys/time.h>
+#include <unistd.h>
+
+//#include "h264.h"
+#include "bitsLib.h"
+
+#include "TSmuxLib.h"
+#include "crcgenerateLib.h"
+
+//#define TS_H264 1
+#define TS_H264_AAC 1
+
+
+#if 0
+static void SetPCR(Ts_Muxer_T *pTsMutex, unsigned char *pBuffer, unsigned long long i_dts );
+#endif
+static int SetPts(Ts_Muxer_T *pTsMutex, unsigned char *buf, unsigned long long pts);
+static int OneFrametoPES(Ts_Muxer_T *pTsMutex, unsigned char * pFrame, int frametype, unsigned short nFrameLen, unsigned long long pts);
+static int PEStoTsPackets(Ts_Muxer_T *pTsMutex, int frametype, PES_Header *pPES);
+static int MakeTSPacket(Ts_Muxer_T *pTsMutex, TS_TYPE type, void *para);
+static inline int PESHeader( unsigned char *p_hdr, unsigned long long i_pts, unsigned long long i_dts, int i_es_size, int es_fmt, int i_stream_id, int b_mpeg2, int b_data_alignment, int i_header_size );
+
+static inline int PESHeader( unsigned char *p_hdr, unsigned long long i_pts, unsigned long long i_dts, int i_es_size, int es_fmt, int i_stream_id, int b_mpeg2, int b_data_alignment, int i_header_size )
+{
+    bits_buffer_t bits;
+    int     i_extra = 0;
+    int i_private_id = -1;
+    int i_stream_id_extension = 0;
+
+    /* HACK for private stream 1 in ps */
+    if( ( i_stream_id >> 8 ) == PES_PRIVATE_STREAM_1 )
+    {
+        i_private_id = i_stream_id & 0xff;
+        i_stream_id = PES_PRIVATE_STREAM_1;
+        /* For PES_PRIVATE_STREAM_1 there is an extra header after the
+           pes header */
+        /* i_private_id != -1 because TS use 0xbd without private_id */
+        i_extra = 1;
+        if( ( i_private_id & 0xf0 ) == 0x80 )
+            i_extra += 3;
+    }
+    else if( ( i_stream_id >> 8 ) == PES_EXTENDED_STREAM_ID )
+    {
+        /* Enable support for extended_stream_id as defined in
+         * ISO/IEC 13818-1:2000/Amd.2:2003 */
+        /* NB, i_extended_stream_id is limited to 7 bits */
+        i_stream_id_extension = i_stream_id & 0x7f;
+        i_stream_id = PES_EXTENDED_STREAM_ID;
+    }
+
+    bits_initwrite( &bits, 50, p_hdr );
+
+    /* add start code */
+    bits_write( &bits, 24, 0x01 );
+    bits_write( &bits, 8, i_stream_id );
+    switch( i_stream_id )
+    {
+        case PES_PROGRAM_STREAM_MAP:
+        case PES_PADDING:
+        case PES_PRIVATE_STREAM_2:
+        case PES_ECM:
+        case PES_EMM:
+        case PES_PROGRAM_STREAM_DIRECTORY:
+        case PES_DSMCC_STREAM:
+        case PES_ITU_T_H222_1_TYPE_E_STREAM:
+            /* add pes data size  */
+            bits_write( &bits, 16, i_es_size );
+            bits_align( &bits );
+            return( bits.i_data );
+
+        default:
+            /* arg, a little more difficult */
+            if( b_mpeg2 )
+            {
+                int i_pts_dts;
+                int b_pes_extension_flag = 0;
+
+                if( i_pts > 0 && i_dts > 0 && ( i_pts != i_dts || ( es_fmt == V_FRAME/* && p_fmt->i_codec != VLC_CODEC_MPGV*/ ) ) )
+                {
+                    i_pts_dts = 0x03;
+                    if ( !i_header_size ) i_header_size = 0xa;
+                }
+                else if( i_pts > 0 )
+                {
+                    i_pts_dts = 0x02;
+                    if ( !i_header_size ) i_header_size = 0x5;
+                }
+                else
+                {
+                    i_pts_dts = 0x00;
+                    if ( !i_header_size ) i_header_size = 0x0;
+                }
+
+                if( i_stream_id == PES_EXTENDED_STREAM_ID )
+                {
+                    b_pes_extension_flag = 1;
+                    i_header_size += 1 + 1;
+                }
+
+                if( b_pes_extension_flag )
+                {
+                    i_header_size += 1;
+                }
+
+                /* Unbounded streams are only allowed in TS (not PS) and only
+                 * for some ES, eg. MPEG* Video ES or Dirac ES. */
+                if( i_es_size > PES_PAYLOAD_SIZE_MAX )
+                    bits_write( &bits, 16, 0 ); // size unbounded
+                else
+                    bits_write( &bits, 16, i_es_size + i_extra + 3
+                                 + i_header_size ); // size
+                bits_write( &bits, 2, 0x02 ); // mpeg2 id
+                bits_write( &bits, 2, 0x00 ); // pes scrambling control
+                bits_write( &bits, 1, 0x00 ); // pes priority
+                bits_write( &bits, 1, b_data_alignment ); // data alignement indicator
+                bits_write( &bits, 1, 0x00 ); // copyright
+                bits_write( &bits, 1, 0x00 ); // original or copy
+
+                bits_write( &bits, 2, i_pts_dts ); // pts_dts flags
+                bits_write( &bits, 1, 0x00 ); // escr flags
+                bits_write( &bits, 1, 0x00 ); // es rate flag
+                bits_write( &bits, 1, 0x00 ); // dsm trick mode flag
+                bits_write( &bits, 1, 0x00 ); // additional copy info flag
+                bits_write( &bits, 1, 0x00 ); // pes crc flag
+                bits_write( &bits, 1, b_pes_extension_flag );
+                bits_write( &bits, 8, i_header_size );
+
+                /* write pts */
+                if( i_pts_dts & 0x02 )
+                {
+                    bits_write( &bits, 4, i_pts_dts ); // '0010' or '0011'
+                    bits_write( &bits, 3, i_pts >> 30 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_pts >> 15 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_pts );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    i_header_size -= 0x5;
+                }
+                /* write i_dts */
+                if( i_pts_dts & 0x01 )
+                {
+                    bits_write( &bits, 4, 0x01 ); // '0001'
+                    bits_write( &bits, 3, i_dts >> 30 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_dts >> 15 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_dts );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    i_header_size -= 0x5;
+                }
+                if( b_pes_extension_flag )
+                {
+                    bits_write( &bits, 1, 0x00 ); // PES_private_data_flag
+                    bits_write( &bits, 1, 0x00 ); // pack_header_field_flag
+                    bits_write( &bits, 1, 0x00 ); // program_packet_sequence_counter_flag
+                    bits_write( &bits, 1, 0x00 ); // P-STD_buffer_flag
+                    bits_write( &bits, 3, 0x07 ); // reserved
+                    bits_write( &bits, 1, 0x01 ); // PES_extension_flag_2
+                    /* skipping unsupported parts: */
+                    /*   PES_private_data */
+                    /*   pack_header */
+                    /*   program_packet_sequence_counter */
+                    /*   P-STD_buffer_flag */
+                    if( i_stream_id == PES_EXTENDED_STREAM_ID )
+                    {
+                        /* PES_extension_2 */
+                        bits_write( &bits, 1, 0x01 ); // marker
+                        bits_write( &bits, 7, 0x01 ); // PES_extension_field_length
+                        bits_write( &bits, 1, 0x01 ); // stream_id_extension_flag
+                        bits_write( &bits, 7, i_stream_id_extension );
+                        i_header_size -= 0x2;
+                    }
+                    i_header_size -= 0x1;
+                }
+                while ( i_header_size )
+                {
+                    bits_write( &bits, 8, 0xff );
+                    i_header_size--;
+                }
+            }
+            else /* MPEG1 */
+            {
+                int i_pts_dts;
+
+                if( i_pts > 0 && i_dts > 0 &&
+                    ( i_pts != i_dts || es_fmt == V_FRAME ) )
+                {
+                    bits_write( &bits, 16, i_es_size + i_extra + 10 /* + stuffing */ );
+                    i_pts_dts = 0x03;
+                }
+                else if( i_pts > 0 )
+                {
+                    bits_write( &bits, 16, i_es_size + i_extra + 5 /* + stuffing */ );
+                    i_pts_dts = 0x02;
+                }
+                else
+                {
+                    bits_write( &bits, 16, i_es_size + i_extra + 1 /* + stuffing */);
+                    i_pts_dts = 0x00;
+                }
+
+                /* FIXME: Now should be stuffing */
+
+                /* No STD_buffer_scale and STD_buffer_size */
+
+                /* write pts */
+                if( i_pts_dts & 0x02 )
+                {
+                    bits_write( &bits, 4, i_pts_dts ); // '0010' or '0011'
+                    bits_write( &bits, 3, i_pts >> 30 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_pts >> 15 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_pts );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                }
+                /* write i_dts */
+                if( i_pts_dts & 0x01 )
+                {
+                    bits_write( &bits, 4, 0x01 ); // '0001'
+                    bits_write( &bits, 3, i_dts >> 30 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_dts >> 15 );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                    bits_write( &bits, 15, i_dts );
+                    bits_write( &bits, 1, 0x01 ); // marker
+                }
+                if( !i_pts_dts )
+                {
+                    bits_write( &bits, 8, 0x0F );
+                }
+
+            }
+
+            /* now should be stuffing */
+            /* and then pes data */
+
+            bits_align( &bits );
+            if( i_stream_id == PES_PRIVATE_STREAM_1 && i_private_id != -1 )
+            {
+                bits_write( &bits, 8, i_private_id );
+                if( ( i_private_id&0xf0 ) == 0x80 )
+                {
+                    bits_write( &bits, 24, 0 ); // ac3
+                }
+            }
+            bits_align( &bits );
+            return( bits.i_data );
+    }
+}
+
+void TsMuxerInit(Ts_Muxer_T *pTsMutex)
+{
+	pTsMutex->m_nCountPCR	= 0;
+   
+	pTsMutex->m_pidSIT    = 0x1FFF; 
+	pTsMutex->m_pidPAT    = 0x1FFF; 
+	pTsMutex->m_pidPCR	= 0x1FFF;			
+	pTsMutex->m_pidPMT	= 0x1FFF;
+	pTsMutex->m_pidVideo	= 0x1FFF;			
+	pTsMutex->m_pidAudio	= 0x1FFF;	
+
+	pTsMutex->m_tsPacketsPos = 0;
+
+	pTsMutex->m_aptsInit = 1;
+	pTsMutex->m_hptsInit = 1;
+	pTsMutex->m_pcrInit = 1;
+	
+	pTsMutex->hm_continuity_counter = 0;
+	pTsMutex->am_continuity_counter = 0;
+
+	pTsMutex->m_PAT_continuity_counter = 0;
+   	pTsMutex->m_PMT_continuity_counter = 0;
+   	pTsMutex->m_SIT_continuity_counter = 0;
+
+	pTsMutex->m_pcr0 = 0;
+	pTsMutex->m_num = 0;
+}
+
+void TsMuxerUninit(Ts_Muxer_T *pTsMutex)
+{
+	pTsMutex->m_tsPacketsPos = 0;
+
+	pTsMutex->m_aptsInit = 1;
+	pTsMutex->m_hptsInit = 1;
+	pTsMutex->m_pcrInit = 1;
+	
+	pTsMutex->hm_continuity_counter = 0;
+	pTsMutex->am_continuity_counter = 0;
+	pTsMutex->m_PAT_continuity_counter = 0;
+   	pTsMutex->m_PMT_continuity_counter = 0;
+   	pTsMutex->m_SIT_continuity_counter = 0;
+
+	pTsMutex->m_pcr0 = 0;
+	pTsMutex->m_num = 0;
+}
+
+int Initilize(Ts_Muxer_T *pTsMutex, float framerate,
+					unsigned short pidPCR,
+					unsigned short pidPMT,
+					unsigned short pidAudio,
+					unsigned short pidVedio)
+{
+	pTsMutex->m_nFrameDuration = 1000/framerate;
+	pTsMutex->m_pTsBuff = NULL;
+
+	pTsMutex->m_pidPAT = 0x0000;
+   
+	pTsMutex->m_pidSIT = 0x001F;
+
+	if (pidPCR>0x1F && pidPCR< 0x1FFF)
+		pTsMutex->m_pidPCR = pidPCR;
+	else
+		pTsMutex->m_pidPCR = 0x1001;
+
+	if (pidPMT>0x1F && pidPMT< 0x1FFF)
+		pTsMutex->m_pidPMT = pidPMT;
+	else
+		pTsMutex->m_pidPMT = 0x100;
+
+	if (pidAudio>0x1F && pidAudio< 0x1FFF)
+		pTsMutex->m_pidAudio = pidAudio;
+	else
+		//pTsMutex->m_pidAudio = 0x500;
+	     pTsMutex->m_pidAudio = 0x1100;
+	if (pidVedio>0x1F && pidVedio< 0x1FFF)
+		pTsMutex->m_pidVideo = pidVedio;
+	else
+	//	pTsMutex->m_pidVideo = 0x600;
+		pTsMutex->m_pidVideo = 0x1011;/*参考EasyICE*/
+
+
+	return 1;
+}
+
+void DeInitilize(Ts_Muxer_T *pTsMutex)
+{
+}
+
+/*****************************************************************************
+函数功能:给TS包类型设置PID
+输入参数:
+			StreamType	--- 流类型，0-音频流，1-视频流
+			pid			--- PID值
+
+输出参数:	无
+返 回 值: 	成功返回-1, 失败返回-0
+使用说明:
+******************************************************************************/
+int SetPID(Ts_Muxer_T *pTsMutex, TS_TYPE StreamType, unsigned short pid)
+{
+	if (0 == pid)
+		return 0;
+
+	switch(StreamType)
+	{
+		case TS_PCR_E:
+			pTsMutex->m_pidPCR = pid;
+			return 1;
+
+		case TS_PMT_E:
+			pTsMutex->m_pidPMT = pid;
+			return 1;
+
+		case TS_SIT_E:
+			pTsMutex->m_pidSIT = pid;
+			return 1;
+
+		case TS_AUDIO_E:
+			pTsMutex->m_pidAudio = pid;
+			return 1;
+
+		case TS_VIDEO_E:
+			pTsMutex->m_pidVideo = pid;
+			return 1;
+			
+		default:
+			break;
+	}
+
+	return 0;
+}
+
+
+/*****************************************************************************
+函数功能:把一帧ES打包成PES
+输入参数:
+			*pFrame		--- ES所在的指针
+			frametype	--- 帧类型，I、P、B、IDR、A
+			nFrameLen	--- 帧长度
+输出参数:	m_PesBuff	--- 打包成PES后，所存储的地方
+返 回 值:成功返回打包后的PES大小，否则返回-1
+使用说明:
+创建作者:zhang song fa
+创建日期:2011/02/14
+******************************************************************************/
+int OneFrametoPES(Ts_Muxer_T *pTsMutex, unsigned char * pFrame, int frametype, unsigned short nFrameLen, unsigned long long pts)
+{
+	unsigned char stream_type = (frametype == FRAME_TYPE_AUDIO)?PES_STREAM_ID_AUDIO : PES_STREAM_ID_VIDEO;
+	int frame_type = (frametype == FRAME_TYPE_AUDIO) ? A_FRAME : V_FRAME;
+	pTsMutex->m_PESInfo.pesHeadSize = PESHeader((unsigned char *)&pTsMutex->m_PESInfo, pts, pts, nFrameLen, frame_type, stream_type, 1, 0, 0);
+	pTsMutex->m_PESInfo.pESdata = pFrame;
+	return 0;
+}
+
+/*****************************************************************************
+函数功能:把PES包打包成TS并存入文件
+输入参数:
+			*pPES		--- PES所在的指针
+输出参数:	m_PesBuff	--- 打包成PES后，所存储的地方
+返 回 值:成功返回0，否则返回-1
+使用说明:
+创建作者:zhang song fa
+创建日期:2011/02/14
+******************************************************************************/
+int PEStoTsPackets(Ts_Muxer_T *pTsMutex, int frametype, PES_Header *pPES )
+{
+	unsigned char *p_data = NULL;
+	int		i_size = pPES->pesHeadBuf[4]*256 + pPES->pesHeadBuf[5];
+	int     b_new_pes = 0;
+	int ret = 0;
+
+	b_new_pes = 1;
+	p_data = pPES->pESdata;
+
+	int			b_adaptation_field = 0;
+	int			i_copy = 0;
+	unsigned short	pid = 0;//= 0x1011;
+	//int bufFlag = 0;// 0 : sps  1:pps 2:I帧
+	//int bufPos = 0;
+	
+	if (PES_STREAM_ID_VIDEO == pPES->pesHeadBuf[3])//StreamID)
+	{
+		pid = pTsMutex->m_pidVideo;
+	}
+	else if (PES_STREAM_ID_AUDIO == pPES->pesHeadBuf[3])//StreamID)
+	{
+		pid = pTsMutex->m_pidAudio;
+	}
+
+	while(i_size>0)
+	{
+		/* write header
+		* 8b   0x47    sync byte
+		* 1b           transport_error_indicator
+		* 1b           payload_unit_start
+		* 1b           transport_priority
+		* 13b          pid
+		* 2b           transport_scrambling_control
+		* 2b           if adaptation_field 0x03 else 0x01
+		* 4b           m_continuity_counter
+		*/
+
+		//如果是一个新的PES包，先将PES的包头复制到ts里
+		if (b_new_pes)
+		{
+//			printf("i_size ========== %d\r\n", i_size);
+			if(i_size <= 184 - pPES->pesHeadSize + 13)
+			{
+				i_size -= 13;
+				memset(pTsMutex->m_pTsBuff, 0xff, TS_PACKET_LEN);
+				pTsMutex->m_pTsBuff[0] = SYNC_BYTE;
+				//如果是新的PES包，有效负载单元指示符应该为1，否则为0？
+				pTsMutex->m_pTsBuff[1] = ( b_new_pes ? 0x40 : 0x00 ) | ((pid >> 8) & 0x1f);
+				pTsMutex->m_pTsBuff[2] = pid & 0xFF;
+
+				b_adaptation_field = 1;
+				if (PES_STREAM_ID_VIDEO == pPES->pesHeadBuf[3])//StreamID)
+				{
+					pTsMutex->hm_continuity_counter = (pTsMutex->hm_continuity_counter + 1) % 16;
+
+					//30-0011 0000 10-0001 0000
+					//如果有适应域的情况，应该设置为11，既有适应域又有负载
+					pTsMutex->m_pTsBuff[3] = (b_adaptation_field ? 0x30 : 0x10) | pTsMutex->hm_continuity_counter;
+					//	printf("cch264....");
+				}
+				else if (PES_STREAM_ID_AUDIO == pPES->pesHeadBuf[3])//StreamID)
+				{
+					pTsMutex->am_continuity_counter = (pTsMutex->am_continuity_counter + 1) % 16;
+
+					//30-0011 0000 10-0001 0000
+					//如果有适应域的情况，应该设置为11，既有适应域又有负载
+					pTsMutex->m_pTsBuff[3] = (b_adaptation_field ? 0x30 : 0x10) | pTsMutex->am_continuity_counter;
+					//printf("ccaac....");
+				}
+
+				i_copy = i_size + pPES->pesHeadSize;
+				pTsMutex->m_pTsBuff[4] = 184 - i_copy - 1;
+				pTsMutex->m_pTsBuff[5] = 0;
+
+				memcpy( &pTsMutex->m_pTsBuff[TS_PACKET_LEN - i_copy], pPES->pesHeadBuf, pPES->pesHeadSize );
+				memcpy( &pTsMutex->m_pTsBuff[TS_PACKET_LEN - i_copy + pPES->pesHeadSize], p_data, i_copy - pPES->pesHeadSize );
+				/*copy Ts packets to buffer to Rtp pack */
+//				memcpy(pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN ,pTsMutex->m_pTsBuff,TS_PACKET_LEN);
+				pTsMutex->m_tsPacketsPos += TS_PACKET_LEN;
+				pTsMutex->m_tsPacketsCnt ++;
+
+				pTsMutex->tsCallback.param.curTsPackNum++;
+				if(pTsMutex->tsCallback.param.curTsPackNum >= pTsMutex->tsCallback.param.maxTsPackNum)
+				{
+					if(pTsMutex->tsCallback.tsCallbackFunc != NULL)
+					{
+						ret = pTsMutex->tsCallback.tsCallbackFunc(pTsMutex->tsCallback.param);
+						pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked;
+					}
+					pTsMutex->tsCallback.param.curTsPackNum = 0;
+				}
+				pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN;
+
+				break;
+			}
+			else
+			{
+				if (PES_STREAM_ID_VIDEO == pPES->pesHeadBuf[3])//StreamID)
+				{
+					memcpy(&pTsMutex->m_pTsBuff[4], pPES->pesHeadBuf, pPES->pesHeadSize);//HPES_HEADER_FIX_LEN);
+					i_copy  = i_size<184?i_size:184;
+					i_copy -= pPES->pesHeadSize;//HPES_HEADER_FIX_LEN;
+					//				i_copy += 6;
+					i_size -= 13;// h264的size
+					//				printf("sizeh264....  %d.%d.%d.%d\r\n", pTsMutex->m_pTsBuff[4], pTsMutex->m_pTsBuff[5], pTsMutex->m_pTsBuff[6], pTsMutex->m_pTsBuff[7]);
+				}
+				else if (PES_STREAM_ID_AUDIO == pPES->pesHeadBuf[3])//StreamID)
+				{
+					memcpy(&pTsMutex->m_pTsBuff[4], pPES->pesHeadBuf, pPES->pesHeadSize);//APES_HEADER_FIX_LEN);
+					i_copy  = i_size<184?i_size:184;
+					i_copy -= pPES->pesHeadSize;//APES_HEADER_FIX_LEN;
+					//				i_copy += 6;
+					i_size -= 8;// aac的size
+					//	printf("sizeaac....\r\n");
+				}
+			}
+		}
+		else 
+		{
+			//每一次拷贝的大小
+			i_copy    = i_size<184?i_size:184;
+		}
+
+		//如果复制的长度小于184，那么就应该使用适应域了
+		b_adaptation_field = i_size < 184 ? 1 : 0;
+
+		pTsMutex->m_pTsBuff[0] = SYNC_BYTE;
+		
+		//如果是新的PES包，有效负载单元指示符应该为1，否则为0？
+		pTsMutex->m_pTsBuff[1] = ( b_new_pes ? 0x40 : 0x00 ) | ((pid >> 8) & 0x1f);
+		pTsMutex->m_pTsBuff[2] = pid & 0xFF;
+
+		if (PES_STREAM_ID_VIDEO == pPES->pesHeadBuf[3])//StreamID)
+		{
+			pTsMutex->hm_continuity_counter = (pTsMutex->hm_continuity_counter + 1) % 16;
+
+			//30-0011 0000 10-0001 0000
+			//如果有适应域的情况，应该设置为11，既有适应域又有负载
+			pTsMutex->m_pTsBuff[3] = (b_adaptation_field ? 0x30 : 0x10) | pTsMutex->hm_continuity_counter;
+			//	printf("cch264....");
+		}
+	   	else if (PES_STREAM_ID_AUDIO == pPES->pesHeadBuf[3])//StreamID)
+	   	{
+		   	pTsMutex->am_continuity_counter = (pTsMutex->am_continuity_counter + 1) % 16;
+
+			//30-0011 0000 10-0001 0000
+			//如果有适应域的情况，应该设置为11，既有适应域又有负载
+			pTsMutex->m_pTsBuff[3] = (b_adaptation_field ? 0x30 : 0x10) | pTsMutex->am_continuity_counter;
+			//printf("ccaac....");
+	   	}
+		
+		if(b_new_pes)
+		{
+		//	00 00 00 01 09 10 
+			b_new_pes = 0;
+		}
+
+		if( b_adaptation_field )	//有适应域的情况
+		{
+			int i_stuffing = 184 - i_copy;
+			int i;
+
+			pTsMutex->m_pTsBuff[4] = i_stuffing - 1;		//填充自适应区域的长度
+			
+			if( i_stuffing > 1 )
+			{
+				pTsMutex->m_pTsBuff[5] = 0x00;
+//				if (*(pPES+5)>>7 == 1)
+				if ((pPES->pesHeadBuf[4] >> 7) ==1)
+				{
+			//		pTsMutex->m_pTsBuff[5] |= 0x80;
+				}
+				
+				for( i = 6; i < 6 + i_stuffing - 2; i++ )
+				{
+					pTsMutex->m_pTsBuff[i] = 0xFF;
+				}
+			}
+		}
+		
+		memcpy( &pTsMutex->m_pTsBuff[TS_PACKET_LEN - i_copy], p_data, i_copy );
+		p_data += i_copy;
+		i_size -= i_copy;
+
+		/* Check the buffer size */
+		if((pTsMutex->tsCallback.param.curTsPackNum + 1) > pTsMutex->tsCallback.param.maxTsPackNum){
+			printf("\n###pTsMutex->m_pForTsPacked overload...\n");
+			return 0;
+		}
+
+		/*copy Ts packets to buffer to Rtp pack */
+//		memcpy(pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN ,pTsMutex->m_pTsBuff,TS_PACKET_LEN);
+		pTsMutex->m_tsPacketsPos += TS_PACKET_LEN;
+		pTsMutex->m_tsPacketsCnt ++;
+
+		pTsMutex->tsCallback.param.curTsPackNum++;
+		if(pTsMutex->tsCallback.param.curTsPackNum >= pTsMutex->tsCallback.param.maxTsPackNum)
+		{
+			if(pTsMutex->tsCallback.tsCallbackFunc != NULL)
+			{
+				ret = pTsMutex->tsCallback.tsCallbackFunc(pTsMutex->tsCallback.param);
+				pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked;
+			}
+			pTsMutex->tsCallback.param.curTsPackNum = 0;
+		}
+		pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN;
+
+	}
+
+	return ret;
+}
+
+#if 0
+/*****************************************************************************
+函数功能:给TS包设置PCR值
+输入参数:
+			*pPES		--- PES所在的指针
+输出参数:	m_PesBuff	--- 打包成PES后，所存储的地方
+返 回 值:成功返回0，否则返回-1
+使用说明:
+创建作者:zhang song fa
+创建日期:2011/02/14
+******************************************************************************/
+void SetPCR(Ts_Muxer_T *pTsMutex, unsigned char *pBuffer, unsigned long long i_dts)
+{
+	unsigned long long i_pcr = 9 * i_dts / 100;
+	
+	pBuffer[0]  = (( i_pcr >> 25 )&0xff);
+	pBuffer[1]  = (( i_pcr >> 17 )&0xff);
+	pBuffer[2]  = (( i_pcr >> 9  )&0xff);
+	pBuffer[3]  = (( i_pcr >> 1  )&0xff);
+	pBuffer[4] |= 	   ( i_pcr << 7  )&0x80;
+}
+#endif
+
+/*****************************************************************************
+函数功能:给PES包打上pts值
+输入参数:
+			*buf		--- PES所在的指针
+输出参数:	m_PesBuff	--- 打包成PES后，所存储的地方
+返 回 值:成功返回0，否则返回-1
+使用说明:
+创建作者:zhang song fa
+创建日期:2011/02/14
+******************************************************************************/
+int SetPts(Ts_Muxer_T *pTsMutex, unsigned char *buf, unsigned long long pts)
+{
+	//1110 0000 0000 0000 0000 0000 0000 0000	右移29位后获得高3位
+	buf[0] = ((pts >> 29) | 0x31 ) & 0x3f;		//0011 0001
+	buf[1] = pts >> 22;
+	buf[2] = (pts >> 14) | 0x01;
+	buf[3] = pts >> 7;
+	buf[4] = (pts << 1) | 0x01;
+	return 0;
+}
+
+/* 制作TS包中的PAT、PMT、PCR等 */
+int MakeTSPacket(Ts_Muxer_T *pTsMutex, TS_TYPE type, void *para)
+{
+	memset(pTsMutex->m_pTsBuff, 0xFF, TS_PACKET_LEN);
+	//47 10 01 20 B7 10 01 9B A4 DC 7E 00 
+	pTsMutex->m_pTsBuff[0] = SYNC_BYTE;
+	
+	/*当TS包为PAT PMT SIT PCR等特殊包
+	  传输误码指示符
+	  有效负载单元指示符
+	  传输优先
+	  都应该为0
+	*/
+	if (TS_PCR_E == type)			//给PCR包的PID为0x1001
+	{
+		pTsMutex->m_pTsBuff[1] = (pTsMutex->m_pidPCR >> 8) & 0xFF;		//0_0_0_10000 00000001
+		pTsMutex->m_pTsBuff[2] = pTsMutex->m_pidPCR & 0x00FF;
+		
+		//00_10_0000
+		/*
+			传输加扰控制	应该为0
+			自适应控制		为10－仅有适应域，没有有效负载
+			连续计数		为0
+		*/
+		pTsMutex->m_pTsBuff[3] = 0x20;
+		
+		//自适应域长度
+		pTsMutex->m_pTsBuff[4] = 0xB7;		//188 - 4字节包头 - 1字节自适应区长
+		
+		//标志0_0_0_1_0_0_0_0		有PCR标志
+		pTsMutex->m_pTsBuff[5] = 0x10;
+		
+		unsigned long long int *PCR_value = (unsigned long long int *)para;
+		unsigned long long int PCR = *PCR_value;
+     
+		unsigned long long int  PCR_B = (PCR/300)%0x200000000ull; //(TI G++)
+             //   unsigned long long PCR_B = (PCR/300)%0x200000000;
+
+		unsigned long long int PCR_E = PCR%300;
+
+		pTsMutex->m_pTsBuff[11] = PCR_E &  0xFF;
+
+		pTsMutex->m_pTsBuff[10] = ((PCR_E >> 8 )& 0x01) | ((PCR_B & 0x01)<<7)	| 0x7E;
+		pTsMutex->m_pTsBuff[9] = (PCR_B >> 1)		& 0xFF;
+		pTsMutex->m_pTsBuff[8] = (PCR_B >> (8+1))		& 0xFF;
+		pTsMutex->m_pTsBuff[7] = (PCR_B >> (16+1))	& 0xFF;
+		pTsMutex->m_pTsBuff[6] = (PCR_B >> (24+1))	& 0xFF;
+        
+	}
+	else if (TS_PAT_E == type)
+	{
+		pTsMutex->m_pTsBuff[1] = 0x40;		/* 有效负载单元起始指示符为1*/
+		pTsMutex->m_pTsBuff[2] =	0x00;
+
+		pTsMutex->m_pTsBuff[3] =  0x10 | pTsMutex->m_PAT_continuity_counter;/* 无自适应区，只有有效载荷*/
+		pTsMutex->m_PAT_continuity_counter = (pTsMutex->m_PAT_continuity_counter+1)%16;
+
+		pTsMutex->m_pTsBuff[4] = 0x00;        /*pointer_field为0x00*/
+		pTsMutex->m_pTsBuff[5] = 0x00;       /*PAT的table_id*/
+		pTsMutex->m_pTsBuff[6] = 0xB0;       /* section_syntax_indicator*/
+		pTsMutex->m_pTsBuff[7] = 0x11;    /*  只有一个节目，所以section_length为17*/
+		pTsMutex->m_pTsBuff[8] = 0x00;
+		pTsMutex->m_pTsBuff[9] = 0x01;    /* transport_stream_id=0x0001,用户自定义，参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[10] = 0xC1;   /*version_number设置为0,current_next_indictor为1*/
+		pTsMutex->m_pTsBuff[11] = 0x00;   /*section_number ,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[12] = 0x00;   /*last_section_number ,参考EasyIEC的数据*/
+
+		pTsMutex->m_pTsBuff[13] = 0x00;   /* program_number,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[14] = 0x00;	/* program_number,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[15] = 0xE0;  /*network_PID ,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[16] = 0x1F;	/* network_PID*/
+
+		pTsMutex->m_pTsBuff[17] = 0x00;   /* program_number,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[18] = 0x01;	/* program_number,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[19] = 0xE0|((pTsMutex->m_pidPMT>> 8) & 0x1f);  /*program_map_PID ,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[20] = pTsMutex->m_pidPMT & 0xFF;	/* program_map_PID,参考EasyIEC的数据*/
+
+
+		unsigned long crc = Crc32Calculate(pTsMutex->m_pTsBuff+5,16);
+
+		pTsMutex->m_pTsBuff[21] = crc>>24 & 0xff;
+		pTsMutex->m_pTsBuff[22] = crc>>16 & 0xff;
+		pTsMutex->m_pTsBuff[23] = crc>>8 & 0xff;
+		pTsMutex->m_pTsBuff[24] = crc & 0xff;
+	}
+	else if (TS_PMT_E == type)
+	{
+		pTsMutex->m_pTsBuff[1] = 0x40|((pTsMutex->m_pidPMT>> 8) & 0x1f);		/* 有效负载单元起始指示符为1*/
+		pTsMutex->m_pTsBuff[2] =	pTsMutex->m_pidPMT& 0xFF;        /* PMT_id*/
+
+		pTsMutex->m_pTsBuff[3] =  0x10 | pTsMutex->m_PMT_continuity_counter;/* 无自适应区，只有有效载荷*/
+		pTsMutex->m_PMT_continuity_counter = (pTsMutex->m_PMT_continuity_counter+1)%16;
+
+		pTsMutex->m_pTsBuff[4] = 0x00;        /*pointer_field为0x00*/
+		pTsMutex->m_pTsBuff[5] = 0x02;       /*PMT的table_id=0x02*/
+		pTsMutex->m_pTsBuff[6] = 0xB0;       /* section_syntax_indicator*/
+		/*	#define TS_H264 1*/
+#ifdef TS_H264
+		pTsMutex->m_pTsBuff[7] = 0x24;    /*  ?section_length=36只有一个节目，所以section_length为23?*/
+#endif
+
+		/*#define TS_H264_AAC 1*/
+#ifdef TS_H264_AAC
+		pTsMutex->m_pTsBuff[7] = 0x29;  /*section_length=41，音视频是一个节目*/
+#endif
+
+		pTsMutex->m_pTsBuff[8] = 0x00;
+		pTsMutex->m_pTsBuff[9] = 0x01;
+		pTsMutex->m_pTsBuff[10] = 0xC1;	   /*version_number设置为0,current_next_indictor为1*/
+		pTsMutex->m_pTsBuff[11] = 0x00;   /*section_number ,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[12] = 0x00;   /*last_section_number ,参考EasyIEC的数据*/
+
+
+		pTsMutex->m_pTsBuff[13] = 0xE0|((pTsMutex->m_pidPCR >> 8) & 0x1f);		//0_0_0_10000 00000001
+		pTsMutex->m_pTsBuff[14] = pTsMutex->m_pidPCR & 0xFF;   /*PCR_PID*/
+
+		pTsMutex->m_pTsBuff[15] = 0xF0;	
+		pTsMutex->m_pTsBuff[16] = 0x0C;   /*program_info_length ,参考EasyIEC的数据*/
+
+		/*以下是program_info_length描述的descriptor()数据*/
+		pTsMutex->m_pTsBuff[17] = 0x05;	
+		pTsMutex->m_pTsBuff[18] = 0x04;
+		pTsMutex->m_pTsBuff[19] = 0x48;	
+		pTsMutex->m_pTsBuff[20] = 0x44;
+		pTsMutex->m_pTsBuff[21] = 0x4D;	
+		pTsMutex->m_pTsBuff[22] = 0x56;
+		pTsMutex->m_pTsBuff[23] = 0x88;	
+		pTsMutex->m_pTsBuff[24] = 0x04;
+		pTsMutex->m_pTsBuff[25] = 0x0F;	
+		pTsMutex->m_pTsBuff[26] = 0xFF;
+		pTsMutex->m_pTsBuff[27] = 0xFC;	
+		pTsMutex->m_pTsBuff[28] = 0xFC;
+
+		pTsMutex->m_pTsBuff[29] = pTsMutex->m_videoType;
+		pTsMutex->m_pTsBuff[30] = 0xE0|((pTsMutex->m_pidVideo >> 8) & 0x1f);
+		pTsMutex->m_pTsBuff[31] = pTsMutex->m_pidVideo & 0xFF; /*视频elementary_id*/
+		pTsMutex->m_pTsBuff[32] = 0xF0;	
+		pTsMutex->m_pTsBuff[33] = 0x06;   /*ES_info_length,*/
+		/*以下是ES_info_length描述的descriptor()数据*/
+		pTsMutex->m_pTsBuff[34] = 0x28;	
+		pTsMutex->m_pTsBuff[35] = 0x04;
+		pTsMutex->m_pTsBuff[36] = 0x64;	
+		pTsMutex->m_pTsBuff[37] = 0x00;
+		pTsMutex->m_pTsBuff[38] = 0x1F;	
+		pTsMutex->m_pTsBuff[39] = 0xBF;
+
+#ifdef TS_H264
+		unsigned long crc = Crc32Calculate(pTsMutex->m_pTsBuff+5,35);
+
+		pTsMutex->m_pTsBuff[40] = crc>>24 & 0xff;
+		pTsMutex->m_pTsBuff[41] = crc>>16 & 0xff;
+		pTsMutex->m_pTsBuff[42] = crc>>8 & 0xff;
+		pTsMutex->m_pTsBuff[43] = crc & 0xff;
+
+#endif
+
+#ifdef TS_H264_AAC
+		pTsMutex->m_pTsBuff[40] = pTsMutex->m_audioType;	/* stream_type aac(用户专用?)*/
+		pTsMutex->m_pTsBuff[41] = 0xE0|((pTsMutex->m_pidAudio>> 8) & 0x1f);
+		pTsMutex->m_pTsBuff[42] = pTsMutex->m_pidAudio& 0xFF; /*音频elementary_id*/
+		pTsMutex->m_pTsBuff[43] = 0xF0;	
+		pTsMutex->m_pTsBuff[44] = 0x00;   /*ES_info_length,*/
+
+		unsigned long crc = Crc32Calculate(pTsMutex->m_pTsBuff+5,40);
+
+		pTsMutex->m_pTsBuff[45] = crc>>24 & 0xff;
+		pTsMutex->m_pTsBuff[46] = crc>>16 & 0xff;
+		pTsMutex->m_pTsBuff[47] = crc>>8 & 0xff;
+		pTsMutex->m_pTsBuff[48] = crc & 0xff;
+
+#endif
+
+		/*#define TS_AAC 1*/
+#ifdef TS_AAC
+		pTsMutex->m_pTsBuff[7] = 0x1e;    /*  ?只有一个节目，所以section_length为23?*/
+
+		pTsMutex->m_pTsBuff[8] = 0x00;
+		pTsMutex->m_pTsBuff[9] = 0x01;
+		pTsMutex->m_pTsBuff[10] = 0xC1;	   /*version_number设置为0,current_next_indictor为1*/
+		pTsMutex->m_pTsBuff[11] = 0x00;	/*section_number ,参考EasyIEC的数据*/
+		pTsMutex->m_pTsBuff[12] = 0x00;	/*last_section_number ,参考EasyIEC的数据*/
+
+
+		pTsMutex->m_pTsBuff[13] = 0xE0|((m_pidPCR >> 8) & 0x1f);		//0_0_0_10000 00000001
+		pTsMutex->m_pTsBuff[14] = m_pidPCR & 0xFF;   /*PCR_PID*/
+
+		pTsMutex->m_pTsBuff[15] = 0xF0;	
+		pTsMutex->m_pTsBuff[16] = 0x0C;	/*program_info_length ,参考EasyIEC的数据*/
+
+		/*以下是program_info_length描述的descriptor()数据*/
+		pTsMutex->m_pTsBuff[17] = 0x05;	
+		pTsMutex->m_pTsBuff[18] = 0x04;
+		pTsMutex->m_pTsBuff[19] = 0x48;	
+		pTsMutex->m_pTsBuff[20] = 0x44;
+		pTsMutex->m_pTsBuff[21] = 0x4D;	
+		pTsMutex->m_pTsBuff[22] = 0x56;
+		pTsMutex->m_pTsBuff[23] = 0x88;	
+		pTsMutex->m_pTsBuff[24] = 0x04;
+		pTsMutex->m_pTsBuff[25] = 0x0F;	
+		pTsMutex->m_pTsBuff[26] = 0xFF;
+		pTsMutex->m_pTsBuff[27] = 0xFC;	
+		pTsMutex->m_pTsBuff[28] = 0xFC;
+
+
+		pTsMutex->m_pTsBuff[29] = 0x0f;	/* stream_type aac*/
+		pTsMutex->m_pTsBuff[30] = 0xE0|((m_pidAudio>> 8) & 0x1f);
+		pTsMutex->m_pTsBuff[31] = m_pidAudio& 0xFF; /*音频elementary_id*/
+		pTsMutex->m_pTsBuff[32] = 0xF0;	
+		pTsMutex->m_pTsBuff[33] = 0x00;	/*ES_info_length,*/
+
+		unsigned long crc = Crc32Calculate(pTsMutex->m_pTsBuff+5,29);
+
+		pTsMutex->m_pTsBuff[34] = crc>>24 & 0xff;
+		pTsMutex->m_pTsBuff[35] = crc>>16 & 0xff;
+		pTsMutex->m_pTsBuff[36] = crc>>8 & 0xff;
+		pTsMutex->m_pTsBuff[37] = crc & 0xff;
+
+
+#endif
+	}
+	else if (TS_SIT_E == type)
+	{
+		pTsMutex->m_pTsBuff[1] = 0x40;
+		pTsMutex->m_pTsBuff[2] = 0x11;
+		pTsMutex->m_pTsBuff[3] = 0x10;
+		pTsMutex->m_pTsBuff[4] = 0x00;
+		pTsMutex->m_pTsBuff[5] = 0x42;
+		pTsMutex->m_pTsBuff[6] = 0xb0;
+		pTsMutex->m_pTsBuff[7] = 0x25;
+		pTsMutex->m_pTsBuff[8] = 0x00;
+		pTsMutex->m_pTsBuff[9] = 0x01;
+
+		pTsMutex->m_pTsBuff[10] = 0xc1;
+		pTsMutex->m_pTsBuff[11] = 0x00;
+		pTsMutex->m_pTsBuff[12] = 0x00;
+		pTsMutex->m_pTsBuff[13] = 0x00;
+		pTsMutex->m_pTsBuff[14] = 0x01;
+		pTsMutex->m_pTsBuff[15] = 0xff;
+		pTsMutex->m_pTsBuff[16] = 0x00;
+		pTsMutex->m_pTsBuff[17] = 0x01;
+		pTsMutex->m_pTsBuff[18] = 0xfc;
+		pTsMutex->m_pTsBuff[19] = 0x80;
+
+		pTsMutex->m_pTsBuff[20] = 0x14;
+		pTsMutex->m_pTsBuff[21] = 0x48;
+		pTsMutex->m_pTsBuff[22] = 0x12;
+		pTsMutex->m_pTsBuff[23] = 0x01;
+		pTsMutex->m_pTsBuff[24] = 0x06;
+		pTsMutex->m_pTsBuff[25] = 0x46;
+		pTsMutex->m_pTsBuff[26] = 0x6d;
+		pTsMutex->m_pTsBuff[27] = 0x70;
+		pTsMutex->m_pTsBuff[28] = 0x65;
+		pTsMutex->m_pTsBuff[29] = 0x67;
+
+		pTsMutex->m_pTsBuff[30] = 0x09;
+		pTsMutex->m_pTsBuff[31] = 0x53;
+		pTsMutex->m_pTsBuff[32] = 0x65;	
+		pTsMutex->m_pTsBuff[33] = 0x67;	
+		pTsMutex->m_pTsBuff[34] = 0x09;	
+		pTsMutex->m_pTsBuff[35] = 0x53;	
+		pTsMutex->m_pTsBuff[36] = 0x65;	
+		pTsMutex->m_pTsBuff[37] = 0x72;	
+		pTsMutex->m_pTsBuff[38] = 0x76;	
+		pTsMutex->m_pTsBuff[39] = 0x69;	
+
+		pTsMutex->m_pTsBuff[40] = 0xff;	
+		pTsMutex->m_pTsBuff[41] = 0x63;	
+		pTsMutex->m_pTsBuff[42] = 0x65;	
+		pTsMutex->m_pTsBuff[43] = 0x30;	
+		pTsMutex->m_pTsBuff[44] = 0x31;	
+		pTsMutex->m_pTsBuff[45] = 0x2c;	
+		pTsMutex->m_pTsBuff[46] = 0xed;	
+		pTsMutex->m_pTsBuff[47] = 0x12;	
+		pTsMutex->m_pTsBuff[48] = 0x21;	
+	}
+	else
+	{
+	
+	}
+	
+	return 0;
+}
+
+int WriteTs(Ts_Muxer_T *pTsMutex, unsigned char *pFrame, int len, FrameType_E frametype, struct timeval *pts)
+{
+	int ret = 0;
+
+	pTsMutex->m_tsPacketsPos = 0;
+	pTsMutex->m_tsPacketsCnt = 0;
+
+	if(frametype != FRAME_TYPE_AUDIO)
+	{
+		if ((pTsMutex->m_num % PCR_INTERVAL) == 0)
+		{
+			MakeTSPacket(pTsMutex, TS_PAT_E, NULL);
+//			memcpy(pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN ,pTsMutex->m_pTsBuff, TS_PACKET_LEN);
+			pTsMutex->m_tsPacketsPos += TS_PACKET_LEN;
+			pTsMutex->m_tsPacketsCnt ++;
+
+			pTsMutex->tsCallback.param.curTsPackNum++;
+			if(pTsMutex->tsCallback.param.curTsPackNum >= pTsMutex->tsCallback.param.maxTsPackNum)
+			{
+				if(pTsMutex->tsCallback.tsCallbackFunc != NULL)
+				{
+					ret = pTsMutex->tsCallback.tsCallbackFunc(pTsMutex->tsCallback.param);
+					pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked;
+				}
+				pTsMutex->tsCallback.param.curTsPackNum = 0;
+			}
+			pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN;
+			
+			MakeTSPacket(pTsMutex, TS_PMT_E, NULL);
+//			memcpy(pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN ,pTsMutex->m_pTsBuff,TS_PACKET_LEN);
+			pTsMutex->m_tsPacketsPos += TS_PACKET_LEN;
+			pTsMutex->m_tsPacketsCnt ++;
+			
+			pTsMutex->tsCallback.param.curTsPackNum++;
+			if(pTsMutex->tsCallback.param.curTsPackNum >= pTsMutex->tsCallback.param.maxTsPackNum)
+			{
+				if(pTsMutex->tsCallback.tsCallbackFunc != NULL)
+				{
+					ret = pTsMutex->tsCallback.tsCallbackFunc(pTsMutex->tsCallback.param);
+					pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked;
+				}
+				pTsMutex->tsCallback.param.curTsPackNum = 0;
+			}
+			pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN;
+	
+			MakeTSPacket(pTsMutex, TS_SIT_E, NULL);
+//			memcpy(pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN ,pTsMutex->m_pTsBuff,TS_PACKET_LEN);
+			pTsMutex->m_tsPacketsPos += TS_PACKET_LEN;
+			pTsMutex->m_tsPacketsCnt ++;
+	 
+			pTsMutex->tsCallback.param.curTsPackNum++;
+			if(pTsMutex->tsCallback.param.curTsPackNum >= pTsMutex->tsCallback.param.maxTsPackNum)
+			{
+				if(pTsMutex->tsCallback.tsCallbackFunc != NULL)
+				{
+					ret = pTsMutex->tsCallback.tsCallbackFunc(pTsMutex->tsCallback.param);
+					pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked;
+				}
+				pTsMutex->tsCallback.param.curTsPackNum = 0;
+			}
+			pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN;
+	
+	                struct timeval t2;
+	                gettimeofday(&t2,NULL);
+	               
+			if(pTsMutex->m_pcrInit){
+				pTsMutex->m_pcrt = t2;
+				//pTsMutex->m_pcrt = *pts;
+				pTsMutex->m_pcr0 = (t2.tv_sec-pts->tv_sec) * 1000 * 27000 + (t2.tv_usec-pts->tv_usec) * 27;
+				//pTsMutex->m_pcr0 = 0;
+				printf("pTsMutex->m_pcr0 %llu\n",pTsMutex->m_pcr0);
+				pTsMutex->m_pcrInit = 0;
+			}
+	        	unsigned long long int PCR =(unsigned long long int)((1000 * (t2.tv_sec-pTsMutex->m_pcrt.tv_sec) * 27000 + (t2.tv_usec-pTsMutex->m_pcrt.tv_usec) * 27 + pTsMutex->m_pcr0)%0x258000000d3ull);
+
+			MakeTSPacket(pTsMutex, TS_PCR_E, (void*)&PCR);
+//			memcpy(pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN ,pTsMutex->m_pTsBuff,TS_PACKET_LEN);
+			pTsMutex->m_tsPacketsPos += TS_PACKET_LEN;
+			pTsMutex->m_tsPacketsCnt ++;
+
+			pTsMutex->tsCallback.param.curTsPackNum++;
+			if(pTsMutex->tsCallback.param.curTsPackNum >= pTsMutex->tsCallback.param.maxTsPackNum)
+			{
+				if(pTsMutex->tsCallback.tsCallbackFunc != NULL)
+				{
+					ret = pTsMutex->tsCallback.tsCallbackFunc(pTsMutex->tsCallback.param);
+					pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked;
+				}
+				pTsMutex->tsCallback.param.curTsPackNum = 0;
+			}
+			pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked + pTsMutex->tsCallback.param.curTsPackNum * TS_PACKET_LEN;
+	
+			pTsMutex->m_pcr0 = PCR;
+	              	pTsMutex->m_pcrt = t2;
+			//pTsMutex->m_pcrt = *pts;
+
+			pTsMutex->m_nCountPCR++;
+		}
+		pTsMutex->m_num++;
+	
+	}
+
+	if(pTsMutex->m_num >= 0xFFFFFFFFu)
+		pTsMutex->m_num = 0;
+
+	int leftLen = len;
+	int packetLen = 0;
+
+	if(pTsMutex->m_hptsInit)
+	{
+		pTsMutex->m_hpts0 = 90000 * 100;		//放大100倍 30000 ,30ms
+		pTsMutex->m_hptst = *pts;
+		pTsMutex->m_hptsInit = 0;
+	}
+	unsigned long long int HPTS = (unsigned long long int )(((1000*((*pts).tv_sec-pTsMutex->m_hptst.tv_sec)*90*100 +((*pts).tv_usec-pTsMutex->m_hptst.tv_usec)*9)) + pTsMutex->m_hpts0);
+
+	pTsMutex->m_hpts0 = HPTS;
+	pTsMutex->m_hptst = *pts;
+	HPTS = (HPTS/100) & 0x1ffffffffll;
+
+	while(leftLen)
+	{
+		if(leftLen > PES_PAYLOAD_SIZE_MAX)
+		{
+			packetLen = PES_PAYLOAD_SIZE_MAX;
+			leftLen -= packetLen;
+		}
+		else
+		{
+			packetLen = leftLen;
+			leftLen -= packetLen;
+		}
+//		printf("%02x. %02x\r\n", pFrame[0], pFrame[1]);
+		if(0 == OneFrametoPES(pTsMutex, pFrame, frametype, packetLen, HPTS))
+		{
+			HPTS = 0;
+			ret = PEStoTsPackets(pTsMutex, frametype, &pTsMutex->m_PESInfo);
+			pFrame += packetLen;
+			continue;
+//			return 0;
+		}
+		else
+		{
+			printf("ES -> PES error\n");
+		}
+	}
+
+	return ret;
+}
+
+/* 设置ts负载的音视频类型 */
+void setStreamType(Ts_Muxer_T *pTsMutex, int videoType, int audioType)
+{
+	pTsMutex->m_videoType = videoType;
+	pTsMutex->m_audioType = audioType;
+
+}
+
+/* 初始化ts回调 */
+void initTsCallBack(Ts_Muxer_T *pTsMutex, void *ptr, unsigned char *pTsBuf, int maxTsPackNum, callbackFunc_t tsCallbackFunc)
+{
+	pTsMutex->tsCallback.param.m_ptr = ptr;
+	pTsMutex->tsCallback.param.m_pForTsPacked = pTsBuf;
+	pTsMutex->tsCallback.param.curTsPackNum = 0;
+	pTsMutex->tsCallback.param.maxTsPackNum = maxTsPackNum;
+	pTsMutex->tsCallback.tsCallbackFunc = tsCallbackFunc;
+
+	pTsMutex->m_pTsBuff = pTsMutex->tsCallback.param.m_pForTsPacked;
+	if(pTsMutex->m_pTsBuff == NULL)
+	{
+		printf("nnnnnnnnnnnnnnnnnnnnnnn\r\n");
+	}
+}
+
+/* 更新ts回调函数的参数 */
+void updateTsCallBackParam(Ts_Muxer_T *pTsMutex, Ts_Callback_Param_T *param)
+{
+	pTsMutex->tsCallback.param.frameType = param->frameType;
+	pTsMutex->tsCallback.param.frameFormat = param->frameFormat;
+	pTsMutex->tsCallback.param.pts = param->pts;
+}
+
+unsigned char * GetBuffForTsPacked(Ts_Muxer_T *pTsMutex)
+{
+	return pTsMutex->tsCallback.param.m_pForTsPacked;
+}
+
+int GetTsPacketsLen(Ts_Muxer_T *pTsMutex)
+{
+	return pTsMutex->m_tsPacketsPos;
+}
+
+int GetTsPacketsCnt(Ts_Muxer_T *pTsMutex)
+{
+	return pTsMutex->m_tsPacketsCnt;
+}
+

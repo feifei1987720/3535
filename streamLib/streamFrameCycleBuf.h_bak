@@ -1,0 +1,30 @@
+
+#include "global.h"
+
+#define SENDER_INDEX_DEEP	5000//
+
+/*保存码流循环缓冲区结构*/
+typedef struct stream_frame_cycle_buf_t
+{
+	unsigned char  *data;                   /*存放码流数据的内存指针*/
+	unsigned char *videoData;
+	unsigned char *audioData;
+	unsigned int   data_length;                     /*缓冲区的长度*/
+	struct packet_index
+	{
+		unsigned int pos;                            /*存放在数组data里的首地址*/
+		int length;                 /*长度 填充数据时大于0, 初始化时等于0, 被释放时等于-1*/
+		unsigned int type;                           /*类型*/
+		int frame_marker;
+		unsigned int record_time;                    /*写入时间*/
+		unsigned int pts;                            /*同步时间*/
+		unsigned int ucsendflag;
+	}index[SENDER_INDEX_DEEP];     /*索引数组，每个索引对应一个Frame*/
+	volatile unsigned int head;                     /*索引头 即最旧帧 起始位置*/
+	volatile unsigned int tail;                     /*索引尾 即最新帧 起始位置*/
+	unsigned int current_index;             /*当前索引*/
+	unsigned int current_pos;                       /*当前写入标志*/
+	long long current_read_pos;
+	unsigned int capability;                         /*剩余容量，初始化给与最大容量值RAWDATA_LENGTH*/
+}stream_frame_cycle_buf_t;
+

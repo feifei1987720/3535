@@ -1,0 +1,423 @@
+/*
+ * 本模块的使用请参考 StreamServiceThread
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <pthread.h>
+
+#include "malloc.h"
+#include "streamFrameQueue.h"
+
+
+/* 初始化帧循环buf */
+int streamInitFrameCycleBuf(stream_frame_cycle_buf_t *pFrameCycleBuf)
+{
+	send_buf[chno].head = 0;
+	send_buf[chno].tail = 0;
+	send_buf[chno].current_index = 0;
+	send_buf[chno].current_pos   = 0;
+	send_buf[chno].current_read_pos = -1;
+
+	/*视频缓冲区初始化*/
+	if(chno == VIDEO_DECODE_CHANNEL)
+	{
+		send_buf[chno].data_length = SENDER_BUF_LENGTH;
+		send_buf[chno].capability     = SENDER_BUF_LENGTH;
+
+		memset(send_buf[chno].index,0,sizeof(send_buf[chno].index));
+
+		send_buf[chno].data = (unsigned char *)malloc(send_buf[chno].data_length);
+		if(NULL == send_buf[chno].data)
+		{
+			fprintf(stderr,"malloc tcp send_buf chn %d error! %d , %s\n",chno,__LINE__,__FILE__);
+			return GS_FAIL;
+		}
+
+		memset(send_buf[chno].data,0,send_buf[chno].data_length);
+
+
+		//send_buf[chno].videoData = (unsigned char *)Memory_alloc(VIDEO_BUF_LEN,&gBufAttrs.bAttrs.memParams);
+		send_buf[chno].videoData = (unsigned char *)CMEM_alloc(VIDEO_BUF_LEN, &heapCmemParam);
+		if(NULL == send_buf[chno].videoData)
+		{
+			DeBug("malloc tcp send_buf chn %d error!",chno);
+			return GS_FAIL;
+		}
+
+		memset(send_buf[chno].videoData,0,VIDEO_BUF_LEN);
+	}
+	/*音频缓冲区初始化*/
+	else if(chno == AUDIO_DECODE_CHANNEL)
+	{
+		Buffer_Attrs       bAttrs    = Buffer_Attrs_DEFAULT;
+		send_buf[chno].data_length      = AUDIO_BUF_LEN;
+		send_buf[chno].capability       = AUDIO_BUF_LEN;
+
+		memset(send_buf[chno].index,0,sizeof(send_buf[chno].index));
+
+		send_buf[chno].data = (unsigned char *)malloc(send_buf[chno].data_length);
+		if(NULL == send_buf[chno].data)
+		{
+			fprintf(stderr,"malloc tcp send_buf chn %d error! %d , %s\n",chno,__LINE__,__FILE__);
+			return GS_FAIL;
+		}
+
+		memset(send_buf[chno].data,0,send_buf[chno].data_length);
+		send_buf[chno].audioData = (unsigned char *)CMEM_alloc(AUDIO_INPUT_SIZE, &heapCmemParam);
+		if(NULL == send_buf[chno].audioData)
+		{
+			DeBug("malloc tcp audio chn %d error!",chno);
+			return GS_FAIL;
+		}
+
+		memset(send_buf[chno].audioData,0,AUDIO_INPUT_SIZE);
+	}
+
+	return 0;
+}
+
+void streamDestroyFrameCycleBuf(stream_frame_cycle_buf_t *pFrameCycleBuf)
+{
+	send_buf[chno].head = 0;
+	send_buf[chno].tail = 0;
+	send_buf[chno].current_index = 0;
+	send_buf[chno].current_pos   = 0;
+
+	if(NULL != send_buf[chno].data)
+	{
+		free(send_buf[chno].data);
+		send_buf[chno].data = NULL;
+	}
+
+	if(chno == VIDEO_DECODE_CHANNEL)
+	{
+		if(NULL != send_buf[chno].videoData)
+		{
+			if (!Memory_free(send_buf[chno].videoData, VIDEO_BUF_LEN, &gBufAttrs.bAttrs.memParams))
+			{
+				fprintf(stderr, "release buffer error.\tfile:%s,\tline:%d\n", __FILE__, __LINE__);
+				return GS_FAIL;
+			}
+
+			send_buf[chno].videoData = NULL;
+		}
+	}
+	else
+	{
+		Buffer_Attrs       bAttrs    = Buffer_Attrs_DEFAULT;
+
+		if(NULL != send_buf[chno].audioData)
+		{
+			if (!Memory_free(send_buf[chno].audioData, AUDIO_BUF_LEN, &bAttrs.memParams))
+			{
+				fprintf(stderr, "release buffer error.\t file:%s,\tline:%d\n", __FILE__, __LINE__);
+				return GS_FAIL;
+			}
+
+			send_buf[chno].audioData= NULL;
+		}
+	}
+}
+
+
+static void LIVEBUF_WriteStream(int chno, const unsigned char *vbuf, int length, unsigned char stream_type, int pts,int marker)
+{
+	int chn_write_pos = 0;
+	int chn_current_index = 0;
+
+	chn_write_pos   = send_buf[chno].current_pos;
+	chn_current_index = send_buf[chno].current_index;
+	memcpy(&send_buf[chno].data[chn_write_pos],vbuf,length);
+
+	/*fill nal infomation in to nal index*/
+	send_buf[chno].index[chn_current_index].pos  = chn_write_pos;
+	send_buf[chno].index[chn_current_index].length  = length;
+	send_buf[chno].index[chn_current_index].type = stream_type;
+	send_buf[chno].index[chn_current_index].pts = pts;
+	send_buf[chno].index[chn_current_index].frame_marker = marker;
+	send_buf[chno].index[chn_current_index].record_time = time((time_t*)NULL);
+
+	/*reset */
+	send_buf[chno].current_pos += length;
+	send_buf[chno].capability  -= length;
+	send_buf[chno].tail = send_buf[chno].current_index;
+	send_buf[chno].current_index = (++send_buf[chno].current_index)%SENDER_INDEX_DEEP;
+
+}
+
+/* 获取空闲的一帧buf，用于数据写入 */
+void streamGetFrameFreeCycleBuffer()
+{
+	unsigned int length = 0;
+	unsigned int chn_head = 0;
+	length   = len;
+	if(send_buf[chno].capability >= length)
+	{
+		LIVEBUF_WriteStream(chno, vbuf, len, stream_type, pts, marker);
+		return;
+	}
+	else
+	{
+		chn_head = send_buf[chno].head;
+
+		/*如果索引头循环到首地址,此时buf的剩余容量是0*/
+		if(send_buf[chno].index[chn_head].pos == 0)
+		{
+			send_buf[chno].current_pos = 0;
+			send_buf[chno].capability  = 0;
+		}
+
+		do
+		{
+			/*如果音频读位置等于写位置则退出函数，即不写*/
+			if(send_buf[chno].index[chn_head].pos == send_buf[chno].current_read_pos)
+			{
+				return;
+			}
+
+			/*从索引头head开始连续释放内存空间,直到剩余容量大于length,或索引头的pos等于0为止*/
+			send_buf[chno].capability += send_buf[chno].index[chn_head].length;
+			send_buf[chno].index[chn_head].length = -1;             /*清除类型标志*/
+			chn_head++;
+			chn_head = (chn_head)%SENDER_INDEX_DEEP;
+			send_buf[chno].head = chn_head;
+
+		}while((send_buf[chno].capability < length)&&( send_buf[chno].index[chn_head].pos != 0));
+
+		if(send_buf[chno].index[chn_head].pos != 0)
+		{
+			LIVEBUF_WriteStream(chno, vbuf, len, stream_type, pts, marker);
+			return;
+		}
+		else   //已经释放空间到内存底部, 索引头head的pos已经回到0位置
+		{
+			send_buf[chno].capability = send_buf[chno].data_length - send_buf[chno].current_pos;
+
+			/*如果内存底部空间足够，就写入内存底部*/
+			if(send_buf[chno].capability >= length)
+			{
+				LIVEBUF_WriteStream(chno, vbuf, len, stream_type,pts, marker);
+				return;
+			}
+
+
+			else //如果内存底不剩余空间还不足，则此时必须从索引头head开始释放
+			{
+				send_buf[chno].current_pos = 0;
+				send_buf[chno].capability = 0;
+
+				do
+				{
+					/*如果音频读位置等于写位置则退出函数，即不写*/
+					if(send_buf[chno].index[chn_head].pos == send_buf[chno].current_read_pos)
+					{
+						return;
+					}
+
+					/*从索引头head开始连续释放内存空间,直到剩余容量大于length*/
+					send_buf[chno].capability += send_buf[chno].index[chn_head].length;
+					send_buf[chno].index[chn_head].length = -1;     /*清除类型标志*/
+					chn_head++;
+					chn_head = (chn_head)%SENDER_INDEX_DEEP;
+					send_buf[chno].head = chn_head;
+
+				}while(send_buf[chno].capability < length);
+
+				LIVEBUF_WriteStream(chno, vbuf, len, stream_type, pts, marker);
+				return;
+			}
+		}
+	}
+}
+
+/* 获取一帧视频 */
+int streamGetFrameCycleBuf(int *sync_state)
+{
+	int sync_tail   = 0;    /* TCP发送缓冲区,全局最新帧标签 */
+	int chno                = 0;
+	int length              = 0;
+	int pts         = 0;
+	static int      tail    = 0;
+	unsigned char   *raw_buf = NULL;
+	unsigned int nal_type = 0;
+	unsigned int stream_type;
+	unsigned int lengthCount = 0;
+	unsigned int combinFrame = FALSE;
+	static struct _Buffer_Object bufferObj = {0};
+	static int count=1;
+
+	tail = send_buf[chno].tail;
+
+	if((send_buf[chno].index[tail].length <= 0) || (tail == ((sync_tail + 1)%SENDER_INDEX_DEEP)))
+	{
+		return NULL;
+	}
+
+	pts = send_buf[chno].index[tail].pts;
+	length = send_buf[chno].index[tail].length;
+	nal_type = send_buf[chno].index[tail].type;
+	raw_buf = send_buf[chno].data + send_buf[chno].index[tail].pos;
+
+	/*发送下一帧*/
+	tail++;
+	tail %= SENDER_INDEX_DEEP;
+
+	return NULL;
+}
+
+
+//////////////////////////////////////////////////////////////////////
+/* 为了减少一次拷贝，所以增加以下几个函数，用的时候注意锁*/
+/* 锁住帧队列 */
+void streamFrameQueueLock(stream_frame_queue_t *pFrameQueue)
+{
+	pthread_mutex_lock(&pFrameQueue->frameMutex);
+}
+/* 解锁帧队列 */
+void steramFrameQueueUnlock(stream_frame_queue_t *pFrameQueue)
+{
+	pthread_mutex_unlock(&pFrameQueue->frameMutex);
+}
+/* 获取一帧的缓冲 */
+stream_frame_t * streamGetFrameQueueBuffer(stream_frame_queue_t *pFrameQueue, int frameLen)
+{
+	stream_frame_t *pFrame = NULL;
+
+#ifndef TI_MALLOC
+	pFrame = (stream_frame_t *)ShareMalloc( sizeof(stream_frame_t) + frameLen);
+#else
+	CMEM_AllocParams  prm;
+	prm.type = CMEM_HEAP;
+	prm.flags = CMEM_CACHED;
+	prm.alignment = 32;
+	pFrame = (stream_frame_t *)CMEM_alloc( sizeof(stream_frame_t) + frameLen, &prm);
+	if(pFrame == NULL)
+	{
+		printf("xxjjjjjjjjjjjjjjjjjjjjjjj\r\n");
+	}
+	else
+	{
+		printf("oooookkkkkkkkkkkkk\r\n");
+	}
+#endif
+	return pFrame;
+}
+/* 插入一帧到帧队列中   （指针赋值）*/
+void streamInsertFrameToFrameQueue(stream_frame_queue_t *pFrameQueue, stream_frame_t *pFrame)
+{
+	int writePos = 0;
+
+	writePos = pFrameQueue->writePos;
+
+	if(pFrameQueue->pFrameInfo[writePos] != NULL)
+	{
+#ifndef TI_MALLOC
+		ShareFree(pFrameQueue->pFrameInfo[writePos]);
+#else
+#if 0
+		CMEM_AllocParams  prm;
+		prm.type = CMEM_HEAP;
+		prm.flags = 0;
+		prm.alignment = 0;
+		CMEM_free(pFrameQueue->pFrameInfo[writePos], &prm);
+		printf("2reeeeeeeeeeeee\r\n");
+#endif
+#endif
+	}
+	pFrameQueue->pFrameInfo[writePos] = pFrame;
+
+	writePos = (writePos + 1) % MAX_FRAME_QUEUE_NUM;
+	pFrameQueue->writePos = writePos;
+}
+//////////////////////////////////////////////////////////////////////
+
+
+#if 0
+/* 插入一帧数据到帧队列中  （数据拷贝）*/
+int streamSendFrameToNetPool(stream_frame_queue_t *pFrameQueue, char *pStreamBuf, int streamBufLen)
+{			
+	int writePos = 0;
+
+	pthread_mutex_lock(&pFrameQueue->frameMutex);
+
+	writePos = pFrameQueue->writePos;
+
+	ShareFree(pFrameQueue->pFrameInfo[writePos]);
+	pFrameQueue->pFrameInfo[writePos] = (stream_frame_t *)ShareMalloc( sizeof(stream_frame_t) + streamBufLen );
+
+	pFrameQueue->pFrameInfo[writePos]->frameHead.len = streamBufLen;
+	memcpy(pFrameQueue->pFrameInfo[writePos]->pFrameBuf, pStreamBuf, streamBufLen);
+
+	writePos = (writePos + 1) % MAX_FRAME_QUEUE_NUM;
+	pFrameQueue->writePos = writePos;
+
+	pthread_mutex_unlock(&pFrameQueue->frameMutex);	
+
+	return 0;
+}
+#endif
+
+/* 获取一帧视频 */
+stream_frame_t* streamGetFrameFromNetPool(stream_frame_queue_t *pFrameQueue, int *pReadBegin, int *pReadEnd)
+{
+	int writePos = 0;
+	stream_frame_t *pFrameInfo = NULL;
+
+	if (*pReadBegin == *pReadEnd && *pReadEnd == pFrameQueue->writePos)
+	{
+		return NULL;
+	}
+
+	if((*pReadBegin == -1) && (*pReadEnd == -1))
+	{
+		*pReadBegin = pFrameQueue->writePos;
+		*pReadEnd = pFrameQueue->writePos;
+	}
+
+	pthread_mutex_lock(&pFrameQueue->frameMutex);	
+
+	writePos = pFrameQueue->writePos;
+
+	if((*pReadBegin <= *pReadEnd && *pReadEnd <= writePos) || (*pReadEnd <= writePos && writePos <= *pReadBegin) || (writePos <= *pReadBegin && *pReadBegin <= *pReadEnd))
+	{
+		*pReadEnd = writePos;
+#ifndef TI_MALLOC
+		pFrameInfo = (stream_frame_t *)ShareCopy(pFrameQueue->pFrameInfo[*pReadBegin]);		
+#else
+		pFrameInfo = pFrameQueue->pFrameInfo[*pReadBegin];
+#endif
+		*pReadBegin = (*pReadBegin + 1) % MAX_FRAME_QUEUE_NUM;
+	}
+	else
+	{
+		printf("failed : lost frame, rb(%d), re(%d), wp(%d)!\r\n", *pReadBegin, *pReadEnd, writePos);
+		*pReadEnd = writePos;
+		*pReadBegin = writePos;
+	}
+
+	pthread_mutex_unlock(&pFrameQueue->frameMutex);
+
+	return pFrameInfo;
+}
+
+/* 释放一帧视频 */
+void streamFreeFrameBuffer(stream_frame_queue_t *pFrameQueue, stream_frame_t *pFrameInfo)
+{
+#ifndef TI_MALLOC
+	ShareFree(pFrameInfo);
+#else
+#if 0
+	CMEM_AllocParams  prm;
+	prm.type = CMEM_HEAP;
+	prm.flags = 0;
+	prm.alignment = 0;
+	CMEM_free(pFrameInfo, &prm);
+	printf("3reeeeeeeeeeeee\r\n");
+#endif
+#endif
+}
+
+
+

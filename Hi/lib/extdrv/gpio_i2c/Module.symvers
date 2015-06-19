@@ -1,0 +1,2 @@
+0x00000000	gpio_i2c_read	/home/pub/platform_h4/mpp/extdrv/hi3535/gpio_i2c/gpioi2c	EXPORT_SYMBOL
+0x00000000	gpio_i2c_write	/home/pub/platform_h4/mpp/extdrv/hi3535/gpio_i2c/gpioi2c	EXPORT_SYMBOL

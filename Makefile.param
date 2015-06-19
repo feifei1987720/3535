@@ -1,0 +1,115 @@
+# Makefile.param 
+# Only global variable should be defined here.
+# All the variables must be used as "export" and "?=".
+# Otherwise, there will be some errors, when Makefile.param is nested.
+
+# Use this file as the following sample
+# ifeq ($(PARAM_FILE), )
+#     PARAM_FILE:=../Makefile.param
+#     include $(PARAM_FILE)
+# endif
+
+# Define the default OS link directory.
+export HIWORK_PATH?=/root/workspace/3531/3531_sdk/Hi3531_SDK_V1.0.8.0_glibc#/hiwork
+
+# One ARCH may have a variety of CHIPs
+
+export HIARCH?=hi3535
+export HI_CROSS?=glibc#uclibc
+
+ifeq ($(HIARCH),hi3535)
+export HICHIP?=0x35350100
+endif
+
+
+ifeq ($(HIARCH),hi3535)
+export CHIP_TYPE=CHIP_TYPE_hi3535v100
+endif
+
+
+
+ifeq ($(HIARCH),hi3535)
+export ARCH_DIR?=hi3535
+endif
+
+
+
+
+# One CHIP may have a variety of customer's version. '.C01' or '.C02' and so on.
+ifeq ($(HI_CROSS),glibc)
+export CVER?= .C02
+else
+export CVER?= .C01
+endif
+
+ifeq ($(HIARCH),hi3531)
+export SPVER?=SPC070
+endif
+
+ifeq ($(HIARCH),hi3535)
+export SPVER?=SPC070
+endif
+
+
+# Whether support the debug information. HI_DEBUG or HI_RELEASE 
+export HIDBG?=HI_DEBUG
+#export HIDBG?=HI_RELEASE
+
+# Whether open -g 
+#export HIGDB?=HI_GDB
+export HIGDB?=HI_NOGDB
+
+# FPGA borad or not
+export FPGA?=N
+
+ifeq ($(FPGA),Y)
+#export CVER=.test
+export HI_FPGA:=HI_FPGA
+export EXTDRV:=extdrv_$(HIARCH)_fpga
+else
+export HI_FPGA:=HI_XXXX
+export EXTDRV:=extdrv
+endif
+
+export HI3535
+
+# Get the local SDK_ROOT path or RELEASE_ROOT path by PARAM_FILE.
+# PARAM_FILE is configed at Makefile before include this file
+export PARAM_FILE
+#export SDK_PATH?=/root/workspace/3531/3531_sdk/Hi3531_SDK_V1.0.8.0_glibc/mpp/#$(shell cd $(PWD)/`dirname $(PARAM_FILE)`/..; pwd)
+
+ifeq ($(HIARCH),hi3535)
+export SDK_PATH?=$(PWD)/Hi/lib
+export  CPU_TYPE=HI3535
+export  CPU=HI3535
+endif
+
+ifeq ($(HI_CROSS),glibc)
+export ARCH?=arm
+export CROSS_COMPILE?= arm-hisiv200-linux-
+export CROSS?= arm-hisiv200-linux-
+else
+export ARCH?=arm
+export CROSS_COMPILE?= arm-hisiv100nptl-linux-
+export CROSS?= arm-hisiv100nptl-linux-
+endif
+ifeq ($(CROSS), )
+    $(error CROSS not defined! Please check LINUX_ROOT=$(LINUX_ROOT) )
+endif
+
+export CC:=$(CROSS)gcc
+export CPP:=$(CROSS)g++
+export AR:=$(CROSS)ar
+
+export AUDIO_PATH?=$(SDK_PATH)/audiolib/$(CROSS)
+export JPEGD_PATH?=$(SDK_PATH)/jpegdlib
+
+# Define the object output directory 
+export REL_INC := $(SDK_PATH)/include
+export REL_LIB := $(SDK_PATH)/lib
+export REL_KO  := $(SDK_PATH)/ko
+
+	
+# Define the lib of jpeg codec
+JPEGD_LIBA := $(REL_LIB)/libjpeg.a
+
